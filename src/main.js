@@ -240,18 +240,28 @@ function camera(w, h) {
   }
   return { fh, fv, tanH: Math.tan(fh / 2), tanV: Math.tan(fv / 2) };
 }
-// interactive: while a slider / the light is being dragged, trace with the
-// preview ray grid and spectral count, but keep the final source detection so
-// the image does not jump when the full-quality render replaces it.
-function eff(interactive = false) {
-  const pv = state.preview, fast = pv || interactive;
+function eff() {
+  const pv = state.preview;
   return {
-    rayGrid: fast ? Math.min(state.pvRayGrid, state.rayGrid) : state.rayGrid,
+    rayGrid: pv ? state.pvRayGrid : state.rayGrid,
     maxSources: pv ? state.pvMaxSources : state.maxSources,
     downsample: pv ? state.pvDownsample : state.downsample,
-    spectral: fast ? Math.min(state.pvSpectral, state.spectral) : state.spectral,
+    spectral: pv ? state.pvSpectral : state.spectral,
     dsRatio: pv ? state.pvDownsample / Math.max(state.downsample, 1) : 1,
   };
+}
+
+// While a slider or the light is being dragged, ghosts are accumulated into a
+// buffer ~512 px on the long edge. Fewer, larger pixels turn the sparse ray
+// splats into a smooth (if soft) image, so the ray count can drop to a fixed
+// budget without the dotty look. Source detection is left untouched so the
+// picture does not jump when the full-resolution render replaces it.
+const INTERACTIVE_RAYS = 6e7;
+function interactiveSettings(e, w, h, nPairs, nSources) {
+  const scale = Math.min(8, Math.max(1, 2 ** Math.round(Math.log2(Math.max(w, h) / 512))));
+  const perRay = Math.max(1, nPairs * nSources * 3 * 0.785);
+  const grid = Math.max(8, Math.min(e.rayGrid, 32, Math.floor(Math.sqrt(INTERACTIVE_RAYS / perRay))));
+  return { ...e, rayGrid: grid, spectral: 3, scale };
 }
 const hexRGB = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16) / 255).map(c => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4));
 
@@ -288,7 +298,7 @@ async function renderOnce(gen, interactive) {
   const cancelled = () => gen !== generation;
   const { width: w, height: h } = image;
   const cam = camera(w, h);
-  const e = eff(interactive);
+  let e = { ...eff(), scale: 1 };
   const t0 = performance.now();
 
   // 1. sources
@@ -316,9 +326,10 @@ async function renderOnce(gen, interactive) {
     buildPairList();
   }
   const active = pairsCache.pairs.filter(p => pairEnabled.get(p.a + '-' + p.b) !== false);
+  if (interactive) e = interactiveSettings(e, w, h, active.length, lastSources.length);
 
   // 3. ghosts
-  const ghostKey = JSON.stringify([srcKey, pairKey, active.map(p => p.a * 1000 + p.b), e.rayGrid, e.spectral, state.pupilJitter, state.jitterSeed, state.blades, state.rotation]);
+  const ghostKey = JSON.stringify([srcKey, pairKey, active.map(p => p.a * 1000 + p.b), e.rayGrid, e.spectral, e.scale, state.pupilJitter, state.jitterSeed, state.blades, state.rotation]);
   let ghostStats = null;
   if (ghostKey !== keys.ghost) {
     const grid = buildPupil(e.rayGrid, state.blades, state.rotation, state.pupilJitter, state.jitterSeed);
@@ -326,7 +337,7 @@ async function renderOnce(gen, interactive) {
     setStatus(`ゴースト追跡中… ${active.length} pairs × ${lastSources.length} sources × ${grid.length / 2} rays × ${spec.length / 4} λ`);
     setProgress(0);
     ghostStats = await gpu.renderGhosts({
-      lens, pairs: active, sources: lastSources, grid, spec, shw, shh,
+      lens, pairs: active, sources: lastSources, grid, spec, shw, shh, scale: e.scale,
     }, { onProgress: setProgress, isCancelled: cancelled });
     setProgress(null);
     if (ghostStats.cancelled || cancelled()) return;
@@ -334,7 +345,7 @@ async function renderOnce(gen, interactive) {
   }
   const blurKey = JSON.stringify([keys.ghost, state.ghostBlur, state.ghostBlurPasses]);
   if (blurKey !== keys.blur) {
-    const radius = state.ghostBlur > 0 ? Math.max(1, Math.round(state.ghostBlur * Math.hypot(w, h))) : 0;
+    const radius = state.ghostBlur > 0 ? Math.max(1, Math.round(state.ghostBlur * Math.hypot(w, h) / e.scale)) : 0;
     await gpu.blurGhost(radius, state.ghostBlurPasses);
     keys.blur = blurKey;
   }
@@ -369,7 +380,7 @@ async function renderOnce(gen, interactive) {
   const ms = performance.now() - t0;
   const capped = sourceInfo.total > lastSources.length ? ` (cap ${sourceInfo.total}→${lastSources.length})` : '';
   const rays = ghostStats ? ` · ${(ghostStats.rays / 1e6).toFixed(0)} M rays (GPU ${ghostStats.ms.toFixed(0)} ms)` : '';
-  const mode = state.preview ? ' · PREVIEW' : interactive ? ' · 操作中は簡易表示' : '';
+  const mode = state.preview ? ' · PREVIEW' : interactive ? ` · 操作中は簡易表示 (1/${e.scale} 解像度, ${e.rayGrid}² rays)` : '';
   setStatus(`${w}×${h} · ${lastSources.length} sources${capped} · ${active.length}/${pairsCache.pairs.length} pairs${rays} · total ${ms.toFixed(0)} ms${mode}`);
 }
 
@@ -597,6 +608,9 @@ $('lensList').onchange = ev => selectLens(Lens.fromCatalog(catalog[Number(ev.tar
 // Export
 // ---------------------------------------------------------------------------
 async function composeLinear() {
+  // A drag may have left a low-resolution ghost buffer: wait for the full render.
+  if (gpu.gScale !== 1 && !rendering) scheduleRender(0);
+  while (gpu.gScale !== 1 || rendering) await new Promise(r => setTimeout(r, 100));
   const n = image.width * image.height, e = eff();
   const gg = state.flareGain * e.dsRatio * e.dsRatio, hg = state.hazeGain, sg = state.starGain, ig = 2 ** state.inputEV;
   const [ghost, haze, star] = await Promise.all([gpu.read('ghost'), gpu.read('haze'), gpu.read('star')]);

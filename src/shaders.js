@@ -322,7 +322,7 @@ export const displayWGSL = /* wgsl */ `
 struct U {
   imgW: f32, imgH: f32, offX: f32, offY: f32,
   zoom: f32, exposure: f32, inputGain: f32, ghostGain: f32,
-  hazeGain: f32, starGain: f32, hdrScale: f32, pad0: f32,
+  hazeGain: f32, starGain: f32, hdrScale: f32, gScale: f32,
   mode: u32, tonemap: u32, hdr: u32, pad1: u32,
 };
 @group(0) @binding(0) var<uniform> u: U;
@@ -340,6 +340,20 @@ fn oetf(x: f32) -> f32 {
   let v = select(1.055 * pow(a, 1.0 / 2.4) - 0.055, a * 12.92, a <= 0.0031308);
   return sign(x) * v;
 }
+// Ghost buffer may be lower resolution (gScale > 1) during interaction:
+// bilinear upsample, and divide by gScale^2 because each coarse pixel holds
+// the energy of gScale^2 full-resolution pixels.
+fn ghostAt(ip: vec2f) -> vec3f {
+  if (u.gScale <= 1.0) { return ghost[u32(ip.y) * u32(u.imgW) + u32(ip.x)].rgb; }
+  let gw = i32(ceil(u.imgW / u.gScale)); let gh = i32(ceil(u.imgH / u.gScale));
+  let q = ip / u.gScale - 0.5;
+  let q0 = vec2i(floor(q)); let f = q - floor(q);
+  let x0 = clamp(q0.x, 0, gw - 1); let x1 = clamp(q0.x + 1, 0, gw - 1);
+  let y0 = clamp(q0.y, 0, gh - 1); let y1 = clamp(q0.y + 1, 0, gh - 1);
+  let a = mix(ghost[u32(y0 * gw + x0)].rgb, ghost[u32(y0 * gw + x1)].rgb, f.x);
+  let b = mix(ghost[u32(y1 * gw + x0)].rgb, ghost[u32(y1 * gw + x1)].rgb, f.x);
+  return mix(a, b, f.y) / (u.gScale * u.gScale);
+}
 fn aces(x: vec3f) -> vec3f {
   return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), vec3f(0.0), vec3f(1.0));
 }
@@ -352,7 +366,7 @@ fn aces(x: vec3f) -> vec3f {
   }
   let i = u32(ip.y) * u32(u.imgW) + u32(ip.x);
   let inp = inputBuf[i].rgb * u.inputGain;
-  let gh = ghost[i].rgb * u.ghostGain;
+  let gh = ghostAt(ip) * u.ghostGain;
   let hz = haze[i].rgb * u.hazeGain;
   let sb = star[i].rgb * u.starGain;
   var c: vec3f;

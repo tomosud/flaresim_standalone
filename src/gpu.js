@@ -70,6 +70,7 @@ export class FlareGPU {
     for (const b of [this.bInput, this.bAcc, this.bGhostRaw, this.bGhost, this.bHaze, this.bStar, this.bTmp]) b?.destroy();
     const n = img.width * img.height;
     this.w = img.width; this.h = img.height; this.n = n;
+    this.gScale = 1; this.gw = img.width; this.gh = img.height;   // ghost buffer resolution
     this.bInput = this.buf(n * 16, S | CD, 'input');
     this.bAcc = this.buf(n * 24, S | CD, 'ghostAcc');
     this.bGhostRaw = this.buf(n * 16, S | CD | CS, 'ghostRaw');   // resolved, before ghost blur
@@ -106,10 +107,9 @@ export class FlareGPU {
     });
   }
 
-  // In-place separable box blur of `target` (vec4 per pixel), `passes` times.
-  encodeBlur(enc, target, radius, passes) {
+  // In-place separable box blur of `target` (vec4 per pixel, w x h), `passes` times.
+  encodeBlur(enc, target, radius, passes, w = this.w, h = this.h) {
     if (radius < 1 || passes < 1) return;
-    const { w, h } = this;
     const uH = this.uniform(new Uint32Array([w, h, w, 1, radius, 0, 0, 0]));
     const uV = this.uniform(new Uint32Array([h, w, 1, w, radius, 0, 0, 0]));
     const bgH = this.bind(this.pBlur, [uH, target, this.bTmp]);
@@ -126,7 +126,8 @@ export class FlareGPU {
    * Trace all (pair, source, pupil sample, wavelength) ghost rays into the
    * raw ghost buffer at gain 1 (the viewer applies Flare Gain); call
    * blurGhost() afterwards to produce the displayed buffer.
-   * job: {lens, pairs:[{a,b,boost,est}], sources, grid:Float32Array(u,v..), spec:Float32Array, shw, shh}
+   * job: {lens, pairs:[{a,b,boost,est}], sources, grid:Float32Array(u,v..), spec:Float32Array, shw, shh,
+   *       scale}  — scale > 1 accumulates into a (w/scale x h/scale) buffer (interactive preview)
    */
   async renderGhosts(job, { onProgress, isCancelled } = {}) {
     const d = this.device, q = d.queue;
@@ -134,9 +135,12 @@ export class FlareGPU {
     // The kernel shares the forward segment between pairs, which needs (b, a) order.
     const pairs = job.pairs.slice().sort((x, y) => x.b - y.b || x.a - y.a);
     const nGrid = grid.length / 2, nSpec = spec.length / 4, nSrc = sources.length, nPairs = pairs.length;
+    const scale = job.scale || 1;
+    const gw = Math.ceil(this.w / scale), gh = Math.ceil(this.h / scale), gn = gw * gh;
+    this.gScale = scale; this.gw = gw; this.gh = gh;
     const enc0 = d.createCommandEncoder();
-    enc0.clearBuffer(this.bAcc);
-    enc0.clearBuffer(this.bGhostRaw);
+    enc0.clearBuffer(this.bAcc, 0, gn * 24);
+    enc0.clearBuffer(this.bGhostRaw, 0, gn * 16);
     q.submit([enc0.finish()]);
     if (!nGrid || !nSrc || !nPairs) return { rays: 0, ms: 0 };
     if (lens.n > 64 || lens.n * nSpec > 768) throw new Error(`lens has ${lens.n} surfaces (max 64)`);
@@ -166,7 +170,7 @@ export class FlareGPU {
 
     const uData = new ArrayBuffer(64), uU = new Uint32Array(uData), uF = new Float32Array(uData);
     uU[0] = lens.n; uU[1] = nGrid; uU[2] = nSpec;
-    uU[6] = this.w; uU[7] = this.h;
+    uU[6] = gw; uU[7] = gh;
     uF[8] = lens.sensorZ; uF[9] = lens.surfaces[0].semi; uF[10] = lens.surfaces[0].z - 20;
     uF[11] = job.shw; uF[12] = job.shh; uF[13] = 1 / nGrid; uF[14] = fixedScale;
 
@@ -202,12 +206,12 @@ export class FlareGPU {
     if (!cancelled) {
       const enc = d.createCommandEncoder();
       const ur = new ArrayBuffer(16);
-      new Uint32Array(ur, 0, 1)[0] = this.n;
+      new Uint32Array(ur, 0, 1)[0] = gn;
       new Float32Array(ur, 8, 1)[0] = 1 / fixedScale;
       const uR = this.uniform(new Uint8Array(ur));
       const pass = enc.beginComputePass();
       pass.setPipeline(this.pResolve); pass.setBindGroup(0, this.bind(this.pResolve, [uR, this.bAcc, this.bGhostRaw]));
-      pass.dispatchWorkgroups(Math.ceil(this.n / 256)); pass.end();
+      pass.dispatchWorkgroups(Math.ceil(gn / 256)); pass.end();
       q.submit([enc.finish()]);
       await q.onSubmittedWorkDone();
     }
@@ -218,8 +222,8 @@ export class FlareGPU {
   // Displayed ghost buffer = raw ghosts blurred; cheap, so Ghost Blur changes don't re-trace.
   async blurGhost(radius, passes) {
     const enc = this.device.createCommandEncoder();
-    enc.copyBufferToBuffer(this.bGhostRaw, 0, this.bGhost, 0, this.bGhost.size);
-    this.encodeBlur(enc, this.bGhost, radius, passes);
+    enc.copyBufferToBuffer(this.bGhostRaw, 0, this.bGhost, 0, this.gw * this.gh * 16);
+    this.encodeBlur(enc, this.bGhost, radius, passes, this.gw, this.gh);
     this.device.queue.submit([enc.finish()]);
     await this.device.queue.onSubmittedWorkDone();
   }
@@ -268,7 +272,7 @@ export class FlareGPU {
     if (!this.displayBG) return;
     this.configure(!!v.hdr);
     const b = new ArrayBuffer(64), f = new Float32Array(b), u = new Uint32Array(b);
-    f.set([this.w, this.h, v.offX, v.offY, v.zoom, v.exposure, v.inputGain, v.ghostGain, v.hazeGain, v.starGain, v.hdrScale, 0]);
+    f.set([this.w, this.h, v.offX, v.offY, v.zoom, v.exposure, v.inputGain, v.ghostGain, v.hazeGain, v.starGain, v.hdrScale, this.gScale]);
     u[12] = v.mode; u[13] = v.tonemap; u[14] = v.hdr ? 1 : 0;
     this.device.queue.writeBuffer(this.uDisplay, 0, b);
     const enc = this.device.createCommandEncoder();
