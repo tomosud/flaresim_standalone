@@ -127,7 +127,10 @@ export class FlareGPU {
    * raw ghost buffer at gain 1 (the viewer applies Flare Gain); call
    * blurGhost() afterwards to produce the displayed buffer.
    * job: {lens, pairs:[{a,b,boost,est}], sources, grid:Float32Array(u,v..), spec:Float32Array, shw, shh,
-   *       scale}  — scale > 1 accumulates into a (w/scale x h/scale) buffer (interactive preview)
+   *       scale, pass, maxPasses}
+   *   scale > 1: accumulate into a (w/scale x h/scale) buffer (interactive preview)
+   *   pass > 0:  progressive refinement — add another sample set to the existing
+   *              accumulator and resolve the average of passes 0..pass
    */
   async renderGhosts(job, { onProgress, isCancelled } = {}) {
     const d = this.device, q = d.queue;
@@ -135,24 +138,32 @@ export class FlareGPU {
     // The kernel shares the forward segment between pairs, which needs (b, a) order.
     const pairs = job.pairs.slice().sort((x, y) => x.b - y.b || x.a - y.a);
     const nGrid = grid.length / 2, nSpec = spec.length / 4, nSrc = sources.length, nPairs = pairs.length;
-    const scale = job.scale || 1;
+    const pass = job.pass || 0;
+    if (pass > 0 && this.gScale !== 1) throw new Error('progressive pass on a preview buffer');
+    const scale = pass > 0 ? 1 : job.scale || 1;
     const gw = Math.ceil(this.w / scale), gh = Math.ceil(this.h / scale), gn = gw * gh;
     this.gScale = scale; this.gw = gw; this.gh = gh;
-    const enc0 = d.createCommandEncoder();
-    enc0.clearBuffer(this.bAcc, 0, gn * 24);
-    enc0.clearBuffer(this.bGhostRaw, 0, gn * 16);
-    q.submit([enc0.finish()]);
+    if (pass === 0) {
+      const enc0 = d.createCommandEncoder();
+      enc0.clearBuffer(this.bAcc, 0, gn * 24);
+      enc0.clearBuffer(this.bGhostRaw, 0, gn * 16);
+      q.submit([enc0.finish()]);
+    }
     if (!nGrid || !nSrc || !nPairs) return { rays: 0, ms: 0 };
     if (lens.n > 64 || lens.n * nSpec > 768) throw new Error(`lens has ${lens.n} surfaces (max 64)`);
 
     // Choose a power-of-two fixed-point scale so the worst case (every ray of
-    // every pair and source landing on one pixel) cannot overflow 2^32.
-    let srcSum = 0;
-    for (const s of sources) srcSum += Math.max(s.r, s.g, s.b);
-    let pairSum = 0;
-    for (const p of pairs) pairSum += p.boost * Math.min(1, 1000 * p.est);
-    const bound = Math.max(srcSum * pairSum, 1e-30);
-    const fixedScale = 2 ** Math.max(-60, Math.min(60, Math.floor(Math.log2(2e9 / bound))));
+    // every pair, source and progressive pass landing on one pixel) cannot
+    // overflow 2^32. Later passes must reuse the scale of pass 0.
+    if (pass === 0) {
+      let srcSum = 0;
+      for (const s of sources) srcSum += Math.max(s.r, s.g, s.b);
+      let pairSum = 0;
+      for (const p of pairs) pairSum += p.boost * Math.min(1, 1000 * p.est);
+      const bound = Math.max(srcSum * pairSum * (job.maxPasses || 1), 1e-30);
+      this.fixedScale = 2 ** Math.max(-60, Math.min(60, Math.floor(Math.log2(2e9 / bound))));
+    }
+    const fixedScale = this.fixedScale;
 
     // Lens uniform: surf[64] = (radius, semi, z, coating), ior[k*n + s] per spectral sample.
     const lensU = new Float32Array(64 * 4 + 192 * 4);
@@ -187,13 +198,15 @@ export class FlareGPU {
     outer:
     for (let p0 = 0; p0 < nPairs; p0 += pairChunk) {
       for (let s0 = 0; s0 < nSrc; s0 += srcChunk) {
-        if (isCancelled?.()) { cancelled = true; break outer; }
+        // A refinement pass is never interrupted half-way: the accumulator
+        // would then hold a partial pass and the average would be wrong.
+        if (pass === 0 && isCancelled?.()) { cancelled = true; break outer; }
         const pc = Math.min(pairChunk, nPairs - p0), sc = Math.min(srcChunk, nSrc - s0);
         uU[3] = s0; uU[4] = p0; uU[5] = pc; uU[15] = sc;
         q.writeBuffer(uBuf, 0, uData);
         const enc = d.createCommandEncoder();
-        const pass = enc.beginComputePass();
-        pass.setPipeline(this.pGhost); pass.setBindGroup(0, bg); pass.dispatchWorkgroups(wgx, sc); pass.end();
+        const cp = enc.beginComputePass();
+        cp.setPipeline(this.pGhost); cp.setBindGroup(0, bg); cp.dispatchWorkgroups(wgx, sc); cp.end();
         q.submit([enc.finish()]);
         done += pc * sc;
         if (++sinceSync >= (this.syncEvery ?? 3) || done >= total) {
@@ -207,11 +220,11 @@ export class FlareGPU {
       const enc = d.createCommandEncoder();
       const ur = new ArrayBuffer(16);
       new Uint32Array(ur, 0, 1)[0] = gn;
-      new Float32Array(ur, 8, 1)[0] = 1 / fixedScale;
+      new Float32Array(ur, 8, 1)[0] = 1 / (fixedScale * (pass + 1));
       const uR = this.uniform(new Uint8Array(ur));
-      const pass = enc.beginComputePass();
-      pass.setPipeline(this.pResolve); pass.setBindGroup(0, this.bind(this.pResolve, [uR, this.bAcc, this.bGhostRaw]));
-      pass.dispatchWorkgroups(Math.ceil(gn / 256)); pass.end();
+      const cp = enc.beginComputePass();
+      cp.setPipeline(this.pResolve); cp.setBindGroup(0, this.bind(this.pResolve, [uR, this.bAcc, this.bGhostRaw]));
+      cp.dispatchWorkgroups(Math.ceil(gn / 256)); cp.end();
       q.submit([enc.finish()]);
       await q.onSubmittedWorkDone();
     }

@@ -335,20 +335,29 @@ export function insideAperture(u, v, blades, rotDeg) {
 }
 
 // mode: 0 grid, 1 stratified, 2 Halton, 3 golden-angle (Vogel spiral, from FlareSimAE)
-export function buildPupil(N, blades, rotDeg, mode, seed) {
+//
+// pass > 0 returns a different, complementary sample set for progressive
+// accumulation (pass 0 is identical to the original node): Halton continues
+// the sequence, Grid / Golden angle are shifted by the R2 low-discrepancy
+// sequence (Roberts 2018), Stratified re-seeds.
+const R2 = [0.7548776662466927, 0.5698402909980532];
+const frac = x => x - Math.floor(x);
+export function buildPupil(N, blades, rotDeg, mode, seed, pass = 0) {
   const out = [];
-  const seedOff = Math.imul(seed >>> 0, 1000003) >>> 0;
+  const seedOff = Math.imul((seed + pass * 7919) >>> 0, 1000003) >>> 0;
+  const shiftU = frac(0.5 + pass * R2[0]), shiftV = frac(0.5 + pass * R2[1]);
   for (let k = 0; k < N * N; k++) {
     const gx = k % N, gy = (k / N) | 0;
     let u, v;
     if (mode === 3) {
-      const r = Math.sqrt((k + 0.5) / (N * N)), ang = k * 2.39996322972865332;
+      const r = Math.sqrt((k + shiftU) / (N * N)), ang = k * 2.39996322972865332 + 2 * Math.PI * (shiftV - 0.5);
       u = r * Math.cos(ang); v = r * Math.sin(ang);
     } else if (mode === 2) {
-      u = halton2(k) * 2 - 1; v = halton3(k) * 2 - 1;
+      const kk = k + pass * N * N;
+      u = halton2(kk) * 2 - 1; v = halton3(kk) * 2 - 1;
     } else {
-      const ju = mode === 1 ? wangHash((k + seedOff) >>> 0) / 4294967296 : 0.5;
-      const jv = mode === 1 ? wangHash((k + N * N + seedOff) >>> 0) / 4294967296 : 0.5;
+      const ju = mode === 1 ? wangHash((k + seedOff) >>> 0) / 4294967296 : shiftU;
+      const jv = mode === 1 ? wangHash((k + N * N + seedOff) >>> 0) / 4294967296 : shiftV;
       u = ((gx + ju) / N) * 2 - 1; v = ((gy + jv) / N) * 2 - 1;
     }
     if (insideAperture(u, v, blades, rotDeg)) out.push(u, v);

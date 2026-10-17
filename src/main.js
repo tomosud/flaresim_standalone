@@ -18,6 +18,7 @@ const SENSORS = [
   ['Custom', 0, 0], ['Full Frame', 36, 24], ['Super 35', 24.89, 18.66],
   ['APS-C Canon', 22.3, 14.9], ['APS-C Nikon/Sony', 23.5, 15.6], ['Micro Four Thirds', 17.3, 13],
 ];
+const MAX_PASSES = 32;   // also bounds the fixed-point scale, so it must not change at run time
 const SPECTRAL = [['3 (R/G/B)', 3], ['5', 5], ['7', 7], ['9', 9], ['11', 11]];
 
 const P = {
@@ -26,6 +27,7 @@ const P = {
   rayGrid: { label: 'Ray Grid (NxN)', type: 'int', min: 4, max: 256, step: 1, def: 64, hint: '入射瞳のサンプル数（一辺）。N² 本の光線' },
   pupilJitter: { label: 'Pupil Sampling', type: 'select', options: [['Grid', 0], ['Stratified', 1], ['Halton', 2], ['Golden angle', 3]], def: 2, hint: 'Grid は低レイ数でドット模様が出やすい。Halton / Golden angle 推奨' },
   jitterSeed: { label: 'Jitter Seed', type: 'int', min: 0, max: 9999, step: 1, def: 0 },
+  passes: { label: 'Progressive passes', type: 'int', min: 1, max: MAX_PASSES, step: 1, def: 8, hint: '描画後も手を止めている間、瞳サンプルをずらした計算を足して平均し、点々を減らしていく回数（1 = オフ）' },
   spectral: { label: 'Spectral Samples', type: 'select', options: SPECTRAL, def: 3 },
   detect: { label: 'Detect bright sources', type: 'check', def: true },
   threshold: { label: 'Threshold', type: 'range', min: 0.1, max: 1000, step: 0.01, def: 2, log: true, hint: 'シーンリニア輝度のしきい値' },
@@ -271,6 +273,7 @@ const hexRGB = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16) / 255).ma
 let gpu = null, image = null;
 let lastSources = [], sourceInfo = { total: 0 };
 const keys = { src: '', ghost: '', blur: '', haze: '', star: '' };
+let ghostPasses = 0;   // progressive passes accumulated for keys.ghost
 let psfCache = { key: '', psf: null };
 let renderTimer = 0, rendering = false, rerender = false, generation = 0, interactiveRender = false;
 
@@ -337,18 +340,21 @@ async function renderOnce(gen, interactive) {
     setStatus(`ゴースト追跡中… ${active.length} pairs × ${lastSources.length} sources × ${grid.length / 2} rays × ${spec.length / 4} λ`);
     setProgress(0);
     ghostStats = await gpu.renderGhosts({
-      lens, pairs: active, sources: lastSources, grid, spec, shw, shh, scale: e.scale,
+      lens, pairs: active, sources: lastSources, grid, spec, shw, shh, scale: e.scale, maxPasses: MAX_PASSES,
     }, { onProgress: setProgress, isCancelled: cancelled });
     setProgress(null);
     if (ghostStats.cancelled || cancelled()) return;
     keys.ghost = ghostKey;
+    ghostPasses = 1;
   }
-  const blurKey = JSON.stringify([keys.ghost, state.ghostBlur, state.ghostBlurPasses]);
-  if (blurKey !== keys.blur) {
+  const blurGhost = async () => {
+    const blurKey = JSON.stringify([keys.ghost, ghostPasses, state.ghostBlur, state.ghostBlurPasses]);
+    if (blurKey === keys.blur) return;
     const radius = state.ghostBlur > 0 ? Math.max(1, Math.round(state.ghostBlur * Math.hypot(w, h) / e.scale)) : 0;
     await gpu.blurGhost(radius, state.ghostBlurPasses);
     keys.blur = blurKey;
-  }
+  };
+  await blurGhost();
 
   // 4. haze
   if (state.hazeGain > 0) {
@@ -381,7 +387,23 @@ async function renderOnce(gen, interactive) {
   const capped = sourceInfo.total > lastSources.length ? ` (cap ${sourceInfo.total}→${lastSources.length})` : '';
   const rays = ghostStats ? ` · ${(ghostStats.rays / 1e6).toFixed(0)} M rays (GPU ${ghostStats.ms.toFixed(0)} ms)` : '';
   const mode = state.preview ? ' · PREVIEW' : interactive ? ` · 操作中は簡易表示 (1/${e.scale} 解像度, ${e.rayGrid}² rays)` : '';
-  setStatus(`${w}×${h} · ${lastSources.length} sources${capped} · ${active.length}/${pairsCache.pairs.length} pairs${rays} · total ${ms.toFixed(0)} ms${mode}`);
+  const head = `${w}×${h} · ${lastSources.length} sources${capped} · ${active.length}/${pairsCache.pairs.length} pairs`;
+  setStatus(`${head}${rays} · total ${ms.toFixed(0)} ms${mode}`);
+  if (interactive) return;
+
+  // 6. progressive refinement: while nothing changes, keep adding passes with
+  //    a shifted pupil sample set and show the running average.
+  const spec = buildSpectrum(e.spectral);
+  while (ghostPasses < state.passes && active.length && lastSources.length) {
+    if (cancelled()) return;
+    const tp = performance.now();
+    const grid = buildPupil(e.rayGrid, state.blades, state.rotation, state.pupilJitter, state.jitterSeed, ghostPasses);
+    await gpu.renderGhosts({ lens, pairs: active, sources: lastSources, grid, spec, shw, shh, pass: ghostPasses, maxPasses: MAX_PASSES });
+    ghostPasses++;
+    await blurGhost();
+    draw();
+    setStatus(`${head} · pass ${ghostPasses}/${state.passes} (${(performance.now() - tp).toFixed(0)} ms/pass)${mode}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
