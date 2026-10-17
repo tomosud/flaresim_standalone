@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlareSim Web</title>
+<meta name="description" content="Physically-based lens flare simulator in the browser (WebGPU port of FlareSim for Nuke / After Effects). HDR display and OpenEXR export.">
+<link rel="stylesheet" href="style.css">
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<header class="top">
+  <div class="brand">FlareSim <span>Web</span></div>
+  <div class="toolbar">
+    <label class="btn">画像を開く<input id="fileImage" type="file" accept=".exr,.hdr,.png,.jpg,.jpeg,.webp,.avif" hidden></label>
+    <button id="btnTest" class="btn">テストシーン</button>
+    <span class="sep"></span>
+    <button id="btnExr" class="btn primary">EXR 書き出し</button>
+    <button id="btnPng" class="btn">PNG 書き出し</button>
+  </div>
+  <div class="hdrstat" id="hdrStat"></div>
+</header>
+
+<main class="layout">
+  <section class="viewer" id="viewer">
+    <canvas id="gpuCanvas"></canvas>
+    <canvas id="overlay"></canvas>
+    <div class="dropzone" id="dropzone">ここに EXR / HDR / PNG / JPG をドロップ</div>
+    <div class="vbar">
+      <select id="outputMode" title="表示する成分">
+        <option value="0">Composite</option>
+        <option value="1">Flare only</option>
+        <option value="2">Ghosts</option>
+        <option value="3">Haze</option>
+        <option value="4">Starburst</option>
+        <option value="5">Sources</option>
+      </select>
+      <label class="inline">EV <input id="exposure" type="range" min="-10" max="10" step="0.1" value="0"><output id="exposureOut">0.0</output></label>
+      <label class="inline" title="HDR ディスプレイで 1.0 を超える輝度をそのまま表示"><input id="hdrOn" type="checkbox"> HDR</label>
+      <select id="tonemap" title="SDR 表示時のトーンマップ">
+        <option value="2">ACES</option><option value="1">Reinhard</option><option value="0">Clamp</option>
+      </select>
+      <button id="btnFit" class="btn small">Fit</button>
+      <button id="btn100" class="btn small">1:1</button>
+    </div>
+    <div class="progress" id="progress"><div id="progressBar"></div></div>
+    <div class="status" id="status">起動中…</div>
+    <div class="probe" id="probe"></div>
+  </section>
+
+  <aside class="panel" id="panel">
+    <details open>
+      <summary>Lens</summary>
+      <input id="lensSearch" type="search" placeholder="レンズを検索 (1,370 本)…">
+      <select id="lensList" size="7"></select>
+      <div class="row2">
+        <label class="btn small">.lens を読込<input id="fileLens" type="file" accept=".lens,.txt" hidden></label>
+        <button id="btnLensDl" class="btn small">.lens 保存</button>
+      </div>
+      <div id="lensInfo" class="info"></div>
+      <canvas id="diagram" class="diagram"></canvas>
+      <div class="param" data-key="stopScale"></div>
+    </details>
+
+    <details open>
+      <summary>Ghost</summary>
+      <div class="param" data-key="flareGain"></div>
+      <div class="param" data-key="rayGrid"></div>
+      <div class="param" data-key="pupilJitter"></div>
+      <div class="param" data-key="jitterSeed"></div>
+      <div class="param" data-key="spectral"></div>
+    </details>
+
+    <details open>
+      <summary>Sources</summary>
+      <div class="param" data-key="detect"></div>
+      <div class="param" data-key="threshold"></div>
+      <div class="param" data-key="inputEV"></div>
+      <div class="param" data-key="sourceCap"></div>
+      <div class="param" data-key="maxSources"></div>
+      <div class="param" data-key="downsample"></div>
+      <div class="param" data-key="clusterRadius"></div>
+      <div class="param" data-key="alphaGate"></div>
+      <div class="param" data-key="sdrExpand"></div>
+      <h4>Manual light <small>(AE 版の Light Position — ビュー上をドラッグ)</small></h4>
+      <div class="param" data-key="manualOn"></div>
+      <div class="param" data-key="manualX"></div>
+      <div class="param" data-key="manualY"></div>
+      <div class="param" data-key="manualRadiance"></div>
+      <div class="param" data-key="manualDiameter"></div>
+      <div class="param" data-key="manualTint"></div>
+    </details>
+
+    <details>
+      <summary>Camera</summary>
+      <div class="param" data-key="useSensor"></div>
+      <div class="param" data-key="fovH"></div>
+      <div class="param" data-key="autoFovV"></div>
+      <div class="param" data-key="fovV"></div>
+      <div class="param" data-key="sensorPreset"></div>
+      <div class="param" data-key="sensorW"></div>
+      <div class="param" data-key="sensorH"></div>
+      <div class="param" data-key="focal"></div>
+    </details>
+
+    <details>
+      <summary>Aperture</summary>
+      <div class="param" data-key="blades"></div>
+      <div class="param" data-key="rotation"></div>
+    </details>
+
+    <details>
+      <summary>Post-process</summary>
+      <div class="param" data-key="ghostBlur"></div>
+      <div class="param" data-key="ghostBlurPasses"></div>
+      <div class="param" data-key="hazeGain"></div>
+      <div class="param" data-key="hazeRadius"></div>
+      <div class="param" data-key="hazePasses"></div>
+      <div class="param" data-key="starGain"></div>
+      <div class="param" data-key="starScale"></div>
+    </details>
+
+    <details>
+      <summary>Preview mode</summary>
+      <div class="param" data-key="preview"></div>
+      <div class="param" data-key="pvRayGrid"></div>
+      <div class="param" data-key="pvMaxSources"></div>
+      <div class="param" data-key="pvDownsample"></div>
+      <div class="param" data-key="pvSpectral"></div>
+    </details>
+
+    <details>
+      <summary>Export</summary>
+      <div class="param" data-key="exrHalf"></div>
+      <div class="param" data-key="exrZip"></div>
+      <div class="param" data-key="exrLayers"></div>
+      <p class="hint">Layers を有効にすると Nuke 版と同じく <code>flare.* / haze.* / starburst.*</code> を同じ EXR に別チャンネルで書き出します。RGBA は現在の Output モードの合成結果（露出なし・シーンリニア）です。</p>
+    </details>
+
+    <details>
+      <summary>Ghost pairs <span id="pairCount" class="badge"></span></summary>
+      <div class="row2">
+        <button id="pairsAll" class="btn small">All</button>
+        <button id="pairsNone" class="btn small">None</button>
+        <button id="pairsTop" class="btn small" title="推定強度の上位 20 だけ有効">Top 20</button>
+      </div>
+      <div id="pairList" class="pairlist"></div>
+    </details>
+
+    <p class="credit">
+      Optics: <a href="https://github.com/space55/blackhole-rt" target="_blank" rel="noopener">Eamonn Nugent</a> ·
+      <a href="https://github.com/LocalStarlight/flaresim_nuke" target="_blank" rel="noopener">flaresim_nuke</a> ·
+      <a href="https://github.com/ken-eizo/flaresim_ae" target="_blank" rel="noopener">flaresim_ae</a> (MIT)
+    </p>
+  </aside>
+</main>
+<script type="module" src="src/main.js"></script>
+</body>
+</html>

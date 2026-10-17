@@ -1,0 +1,240 @@
+# FlareSim Web 技術解説
+
+この文書は、FlareSim（Nuke / After Effects 版）を WebGPU のスタンドアローン Web アプリに移植したときの、計算モデル・GPU 実装・HDR 表示・EXR 書き出し・検証結果をまとめたものです。
+
+---
+
+## 1. 全体像
+
+```
+入力画像 (EXR/HDR/PNG → float RGBA, シーンリニア)
+   │
+   ├─ [CPU] 光源検出  ds×ds ブロック平均 → しきい値 → (クラスタ) → 上限数カット
+   │         sources.js                     ↓ 角度 (ax, ay) と RGB
+   ├─ [CPU] ゴーストペア選別 optics.js filterGhostPairs   … レンズ・画角が変わったときだけ
+   ├─ [CPU] 瞳サンプル / 分光テーブル                       … 設定が変わったときだけ
+   │
+   ├─ [GPU] ゴースト追跡  pairs × sources × 瞳サンプル × 波長  → 64bit 固定小数点で加算
+   │         → 解決 (float) → ボックスブラー ×passes                         shaders.js ghostWGSL
+   ├─ [GPU] ヘイズ  光源ブロックを塗る → 広いボックスブラー                    hazeSeedWGSL / blurWGSL
+   ├─ [GPU] スターバースト  |FFT(絞り)|² の PSF を光源ごとに波長スケールで集約     starburstWGSL
+   │
+   └─ [GPU] 表示  合成 → 露出 → (SDR: トーンマップ | HDR: そのまま) → sRGB 拡張エンコード
+             [CPU] 書き出し  GPU から読み戻して合成 → OpenEXR (exr.js)
+```
+
+計算の重い部分は「ゴースト追跡」で、それ以外は軽い処理です。各成分（光源・ペア・ゴースト・ヘイズ・スターバースト）は依存するパラメータのキーでキャッシュしており、変わった成分だけを再計算します。**Flare Gain / Haze Gain / Starburst Gain は線形倍率なので表示時に掛けるだけ**で、再計算なしに即時反映されます（原典の Nuke ノードではゲインもノードのハッシュに含まれ、変更すると再描画になります）。
+
+## 2. 原典との対応
+
+| 原典 (flaresim_nuke/src) | 本実装 | 備考 |
+| --- | --- | --- |
+| `lens.h/.cpp` `LensSystem::load` | `optics.js` `Lens.parse` / `tools/build-lenses.mjs` | 同じ `.lens` 形式。1,370 本を JSON 1 ファイル (約 1.1 MB) に変換 |
+| `fresnel.h` | `optics.js` / `ghostWGSL` | 分散・Fresnel・薄膜コーティングを同じ式で |
+| `trace.cpp` `trace_ghost_ray` | `optics.js traceGhost` / `ghostWGSL traceGhost` | 3 フェーズ追跡。CPU 版は断面図とペア選別に使用 |
+| `ghost.cpp` `filter_ghost_pairs` | `optics.js filterGhostPairs` | 強度推定と面積補正 |
+| `ghost_cuda.cu` | `shaders.js ghostWGSL` + `gpu.js renderGhosts` | float atomicAdd → 固定小数点 atomic（後述） |
+| `starburst.cpp` | `starburst.js` + `starburstWGSL` | PSF は CPU の FFT、適用は GPU |
+| `FlareSim.cpp do_compute` | `sources.js` + `main.js renderOnce` | 光源検出、クラスタリング、ヘイズ、上限数 |
+| `FlareSim.cpp box_blur` | `blurWGSL` | 縁で窓サイズを正規化する点も同じ |
+| flaresim_ae `FlareLensOptics.cpp`（Golden angle） | `optics.js buildPupil` mode 3 | Vogel 螺旋 |
+| flaresim_ae `FlareLensSourceModel.hpp`（手動光源） | `sources.js` manual | 直径 D の円盤 ≒ π(D/2)²/ds² 個のブロック光源に相当 |
+
+## 3. 光学モデル
+
+### 3.1 レンズ
+
+`.lens` の各行は 1 つの屈折面です。
+
+| 列 | 意味 |
+| --- | --- |
+| radius | 曲率半径 [mm]（符号付き、0 は平面、`stop` は絞り面） |
+| thickness | 次の面までの軸上距離 [mm]。最終面は像面までの距離 |
+| ior | **この面の後ろ**の媒質の d 線屈折率 |
+| abbe | アッベ数（0 は分散なし） |
+| semi_ap | 有効半径 [mm]。これより外に当たった光線はケラれる |
+| coating | AR コート層数（0 = なし、1 = MgF₂ 単層、以降 1 層ごとに反射率 ×0.25） |
+
+面の頂点位置 `z_i` は厚みの累積、像面は `sensor_z = Σ thickness` です。
+
+### 3.2 分散（Cauchy 近似）
+
+アッベ数 `V = (n_d − 1)/(n_F − n_C)` から `n(λ) = A + B/λ²` を決めます。
+
+```
+B = ((n_d − 1)/V) / (1/λ_F² − 1/λ_C²),   A = n_d − B/λ_d²
+λ_F = 486.13, λ_d = 587.56, λ_C = 656.27 nm
+```
+
+### 3.3 反射率
+
+- 無コート面：非偏光の Fresnel 反射率 `R = (r_s² + r_p²)/2`（全反射なら 1）
+- コート面：MgF₂（n = 1.38）、550 nm の 1/4 波長厚の単層膜。2 界面の振幅反射係数 `r01, r12` と位相差 `δ = 2π n_c d cosθ_c / λ` から Airy の式
+
+```
+R = (r01² + r12² + 2 r01 r12 cos2δ) / (1 + r01² r12² + 2 r01 r12 cos2δ)
+```
+
+コートは 550 nm で最も反射が小さく、端の波長ほど反射が残るので、ゴーストは紫やアンバーに色づきます。
+
+### 3.4 ゴースト光線の 3 フェーズ追跡
+
+ゴーストは「面 a と面 b（a < b）の 2 回反射」で生じます。光線 1 本の経路は：
+
+1. **前進**：面 0 … b を透過し、**b で反射**
+2. **後退**：面 b−1 … a を逆向きに透過し、**a で反射**
+3. **前進**：面 a+1 … N−1 を透過して像面へ
+
+各面で球面（または平面）との交点を求め、有効半径の外ならケラれ、Snell の法則で屈折（全反射なら打ち切り）。重みは、反射面で `×R`、透過面で `×(1−R)` を掛けていきます。像面での `(x, y)` [mm] を画素に変換します。
+
+```
+px = (x / (2·shw) + 0.5) · W,   shw = f_nominal · tan(FOV_H/2)
+```
+
+### 3.5 ペアの事前選別と面積補正
+
+N 面のレンズには N(N−1)/2 組のペアがあります。描画前に：
+
+- 面の前後で屈折率がほぼ同じ（空気-空気の絞り面など）ペアを除外
+- 軸上の 1 本の光線で R/G/B の平均重みを推定し、`1e-7` 未満を除外
+- 8×8 の平行光線束で像面上の広がりを測り、`面積比 = ゴーストの外接矩形 / センサー面積` を `[1, 100]` に収めた値を **area boost** として掛ける（大きくボケたゴーストが暗くなりすぎないための原典の補正）
+
+### 3.6 入射瞳サンプリングと波長
+
+- 入射瞳 = 第 1 面の有効半径。`N×N` 個の点（Grid / Stratified / Halton / Golden angle）を作り、絞り羽根の多角形の外側を捨てます。羽根の形はゴーストの形にそのまま写ります
+- 波長は 3（650/550/450 nm を R/G/B に 1 対 1）または 5〜11（400〜700 nm、CIE 等色関数のガウス近似で RGB に重み配分）
+
+光源の角度 `(ax, ay)` から平行光線の方向 `normalize(tan ax, tan ay, 1)` を作り、各瞳点から追跡します。総トレース数は
+
+```
+ペア数 × 光源数 × 瞳サンプル数 × 波長数
+```
+
+標準設定のテストシーンで 253 × 129 × 約 3,200 × 3 ≈ 3.1 億本です。
+
+### 3.7 光源検出（Nuke 版と同じ）
+
+画像を `ds×ds` ブロックに分けて平均し、輝度 `0.2126R + 0.7152G + 0.0722B` が Threshold 以上のブロックを光源にします（Source Cap で上限クランプ、アルファゲート可）。ブロック中心の画素座標を画角から角度に変換し、必要ならクラスタリング（輝度順の貪欲法）、最後に明るい順に Max Sources 個まで残します。
+
+### 3.8 ヘイズ
+
+光源ブロックをその色で塗り、画像対角 × Haze Radius の半径でボックスブラーを複数回（3 回でほぼガウシアン）かけ、ゲインを掛けます。
+
+### 3.9 スターバースト
+
+絞り形状の 512×512 マスクを 2 次元 FFT し、`|F|²` を中心化・ピーク 1 に正規化した Fraunhofer 回折パターンを PSF とします。回折像は波長に比例して広がるので、R/G/B をそれぞれ `λ/550` 倍の半径で PSF を参照して、光芒の先端が赤くなる色づきを出します。N 枚羽根の多角形絞りなら N 本（奇数なら 2N 本）の光芒が出ます。
+
+## 4. GPU 実装（WebGPU / WGSL）
+
+### 4.1 なぜ WebGPU か
+
+- 原典の CUDA カーネルは「1 スレッド = 1 本の瞳サンプル」で、そのまま compute shader に移せる
+- HDR キャンバス（`rgba16float` + `toneMapping: extended`）が使えるのは WebGPU だけ（WebGL では実用的でない）
+- 実測で 3 億本 / 約 0.6 秒（後述）。ブラウザでも対話的に使える速度が出る
+
+### 4.2 ゴースト追跡カーネル
+
+- `@workgroup_size(64)`、`dispatch(ceil(瞳サンプル/64), 組合せ数)`。`workgroup_id.y` が (ペア, 光源) の組合せ番号
+- 面データは 1 面 8 float の storage buffer。追跡ロジックは `optics.js` と 1 行ずつ対応
+- 結果の画素へのバイリニア分配（4 画素）も原典と同じ
+
+### 4.3 float の atomicAdd が無い問題 → 64bit 固定小数点
+
+WGSL には `atomic<f32>` がありません。CAS ループで float 加算を模倣すると、ゴーストが 1 点に集光する画素で競合が激しくなります。そこで **2 つの u32 で 64bit 固定小数点** を作りました。
+
+```
+s  = v × scale
+hi += floor(s)                    // 整数部
+lo += fract(s) × 2³²              // 小数部。atomicAdd の戻り値で桁あふれを検出して hi に繰り上げ
+```
+
+- 解像度 2⁻³²、範囲 2³² で、ダイナミックレンジは約 1.8×10¹⁹
+- `scale` は描画ごとに 2 の冪で選ぶ：「全ペア・全光源・全光線が 1 画素に集まる」最悪値 `Σ光源の最大成分 × Σペア(boost × min(1, 1000·推定重み))` が 2×10⁹ を超えない最大値
+- 整数加算なので**加算順に依存せず、結果が毎回ビット単位で同じ**（CUDA の float atomicAdd は順序で結果が揺れる）
+- 1 ピクセル 24 byte。解決パスで float に戻す
+
+### 4.4 タイムアウト回避とキャンセル
+
+1 回の dispatch が長いと OS の GPU タイムアウト（Windows の TDR は約 2 秒）でデバイスが落ちます。組合せを「1 回あたり約 300 万トレース」の束に分け、束ごとに `queue.writeBuffer`（開始番号）→ `submit` します。2 束ごとに `onSubmittedWorkDone()` を待って進捗バーを更新し、その間にパラメータが変わっていれば途中でやめて新しい描画を始めます。
+
+### 4.5 ボックスブラー
+
+1 スレッドが 1 行（または 1 列）を担当する移動窓和です。HDR では極端に明るい画素が窓から出たあとに float の丸め誤差が残るので、**32 画素ごとに窓内を足し直して**誤差の蓄積を抑えています。縁では窓に入った画素数で割ります（原典の `box_blur` と同じ）。
+
+### 4.6 メモリ
+
+1 画素あたり：入力 16 + 固定小数点 24 + ゴースト / ヘイズ / スターバースト / 作業用 各 16 = **104 byte**。1920×1080 で約 216 MB、4K で約 860 MB。デバイスの storage buffer 上限を超える画像は読み込み時に 1/2 に縮小します。
+
+## 5. HDR 表示
+
+```js
+context.configure({ device, format: 'rgba16float', colorSpace: 'srgb',
+                    toneMapping: { mode: hdr ? 'extended' : 'standard' } });
+```
+
+- シェーダはシーンリニアの値に露出 `2^EV` を掛け、**sRGB の OETF を符号付きで 1.0 より上にも延長**してエンコードします（extended sRGB）。1.0 = SDR の白で、それより上は HDR ディスプレイのヘッドルームまで明るく表示されます
+- HDR ディスプレイかどうかは `matchMedia('(dynamic-range: high)')` で判定（ヘッダーに表示）。初回は自動で HDR を有効にします
+- SDR 表示時は ACES（Narkowicz 近似）/ Reinhard / Clamp から選べます
+- 表示は storage buffer を直接読むフルスクリーン三角形 1 枚（ズーム・パンはシェーダの座標変換）
+
+## 6. OpenEXR
+
+### 6.1 書き出し（`exr.js`、外部ライブラリなし）
+
+- 単一パートのスキャンライン形式。必須属性 `channels, compression, dataWindow, displayWindow, lineOrder, pixelAspectRatio, screenWindowCenter, screenWindowWidth`
+- チャンネル名はアルファベット順に並べ、任意の数を書ける（`A, B, G, R, flare.blue, …`）
+- **ZIP**：16 行ブロック。OpenEXR の前処理（偶数バイト / 奇数バイトの分離 → 差分予測 `+128`）をしてから zlib 圧縮。zlib はブラウザ標準の `CompressionStream('deflate')`。圧縮後のほうが大きければ生データで格納
+- half は round-to-nearest-even で変換（非正規化数・無限大も扱う）
+- 書き出す値は露出をかけないシーンリニア。RGBA は現在の表示モードの合成結果、レイヤー有効時は `flare.*`（ゲイン適用済み）と、使っていれば `haze.*`、`starburst.*`
+
+### 6.2 読み込み
+
+EXR は three.js r169 の `EXRLoader`（PIZ / ZIP / RLE / PXR24 / B44 / DWA などに対応）、`.hdr` は `RGBELoader` を import map 経由で CDN から遅延読み込みします。EXRLoader は行を下から上に格納するので上下を反転します。8bit 画像は sRGB → リニアに変換し、オプションで `v/(1 − 0.98v)` の逆トーンカーブ（1.0 → 50）をかけてハイライトをしきい値以上に持ち上げます。
+
+## 7. 検証
+
+### 7.1 C++ 原典との一致（`tests/parity.mjs`）
+
+flaresim_nuke の `lens.cpp / trace.cpp / ghost.cpp` をそのままビルドした参照プログラム（`tests/ref.cpp`）と、ペアの一覧・area boost・固定 5 本の光線の着地位置と重みを比較します。
+
+| レンズ | ペア数 | 位置の最大差 | 重みの最大相対差 | boost の最大相対差 |
+| --- | --- | --- | --- | --- |
+| Arri Zeiss Master Prime T1.3 50mm | 253 | 1.2×10⁻³ mm | 9.7×10⁻⁶ | 3.4×10⁻⁶ |
+| Nikon AI Nikkor 50mm f/1.2S | 78 | 7.0×10⁻⁴ mm | 2.0×10⁻⁵ | 7.3×10⁻⁶ |
+| Nikon AI AF Fisheye-Nikkor 16mm f/2.8D | 105 | 7.9×10⁻⁵ mm | 6.2×10⁻⁶ | 0 |
+
+ペアの一覧・順序・ケラれ判定は完全に一致し、差は C++ の float32 と JS の float64 の丸めの違いだけです（最大 1.2 µm。1080p で 1 画素 ≈ 19 µm なので 0.1 画素以下）。GitHub Actions（`parity.yml`）で毎回確認します。
+
+### 7.2 GPU と CPU の一致
+
+同じ 6 ペア × 1 光源 × 瞳 32² × 3 波長で、GPU（固定小数点積算）と CPU（float64）の画面内エネルギー合計が 7 桁一致しました（R: 6.799155×10⁻⁴ vs 6.799155×10⁻⁴）。
+
+### 7.3 スターバースト PSF
+
+原典の `compute_starburst_psf`（6 枚羽根、512²）と 7 か所の値と総和を比較し、相対差は 10⁻⁶ 以下でした。
+
+### 7.4 EXR
+
+`exr.js` で書いた half / float × ZIP / 無圧縮（`flare.*` レイヤー付き）の 4 ファイルを、公式の OpenEXR 3.5 Python バインディングで読み込み、float は完全一致、half は half の精度（相対 5×10⁻⁴）以内であることを確認しました。three.js の EXRLoader での読み戻しも同じ結果です。
+
+## 8. 性能
+
+NVIDIA Turing 世代の GPU、Chrome 152、1920×1080、Arri Zeiss Master Prime 50mm（253 ペア）、テストシーン 129 光源、ゴーストブラー込み：
+
+| 瞳サンプル | 波長 | トレース数 | 時間 |
+| --- | --- | --- | --- |
+| 16×16（Halton） | 3 | 2,000 万 | 0.22 秒 |
+| 32×32 | 3 | 7,900 万 | 0.23 秒 |
+| 64×64 | 3 | 3.2 億 | 0.59 秒 |
+| 64×64 | 7 | 7.3 億 | 1.40 秒 |
+| 128×128 | 3 | 12.6 億 | 2.41 秒 |
+
+円形絞りでは N×N の格子のうち円の内側の約 79 % だけが光線になります。
+
+## 9. 原典との違いと制限
+
+- **追加した機能**：Stop scale（絞り面の有効径を縮めて絞り込みを近似）、Input EV、SDR ハイライト持ち上げ、ゲインの即時反映、決定的（再現性のある）積算
+- **AE 版から取り込んだもの**：手動光源（位置・放射輝度・直径・色）、Golden angle サンプリング
+- **未対応**：Nuke のマスク入力（アルファゲートのみ）、フォーマット外（bbox）の検出光源、AE のカスタムレンズエディタ（`.lens` の読み込み・保存のみ）、キーフレームと連番処理、upstream CLI の equirectangular 投影
+- **モデル自体の制限（原典と同じ）**：2 回反射のゴーストのみ（4 回以上は扱わない）、偏光・多層膜は近似、スターバーストは絞りの回折だけでゴースト内部の波動光学は扱わない、低い瞳サンプル数ではボケたゴーストが点の集まりに見える（ブラーかサンプル数で対処）
+- 画像の行の向きは Nuke（下から上）と逆ですが、レンズが回転対称で光源とゴーストに同じ写像を使うので結果は変わりません

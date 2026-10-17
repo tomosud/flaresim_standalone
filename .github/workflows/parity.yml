@@ -1,0 +1,26 @@
+name: Optics parity vs flaresim_nuke
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Fetch original FlareSim (Nuke) sources
+        run: git clone --depth 1 https://github.com/LocalStarlight/flaresim_nuke ../flaresim_nuke
+      - name: Build C++ reference
+        run: g++ -O2 -std=c++17 -I../flaresim_nuke/src tests/ref.cpp ../flaresim_nuke/src/lens.cpp ../flaresim_nuke/src/trace.cpp ../flaresim_nuke/src/ghost.cpp -o ref
+      - name: Compare
+        run: |
+          set -e
+          for L in "Zeiss_50mm_F1.3_(Arri_Zeiss_Master_Prime_T1.3_50mm).lens" "AI_Nikkor_50mm_F1.2S.lens" "AI_AF_Fisheye-Nikkor_16mm_F2.8D.lens"; do
+            F="../flaresim_nuke/lenses/lens_files/$L"
+            ./ref "$F" > ref.txt
+            node tests/parity.mjs "$F" ref.txt
+          done
