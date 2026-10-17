@@ -61,24 +61,25 @@ export class FlareGPU {
   }
 
   get maxPixels() {
-    return Math.floor(Math.min(this.device.limits.maxStorageBufferBindingSize, this.device.limits.maxBufferSize) / 24);
+    return Math.floor(Math.min(this.device.limits.maxStorageBufferBindingSize, this.device.limits.maxBufferSize) / 24);   // largest buffer = ghostAcc
   }
 
   buf(size, usage, label) { return this.device.createBuffer({ size: Math.max(16, Math.ceil(size / 4) * 4), usage, label }); }
 
   setImage(img) {
-    for (const b of [this.bInput, this.bAcc, this.bGhost, this.bHaze, this.bStar, this.bTmp]) b?.destroy();
+    for (const b of [this.bInput, this.bAcc, this.bGhostRaw, this.bGhost, this.bHaze, this.bStar, this.bTmp]) b?.destroy();
     const n = img.width * img.height;
     this.w = img.width; this.h = img.height; this.n = n;
     this.bInput = this.buf(n * 16, S | CD, 'input');
     this.bAcc = this.buf(n * 24, S | CD, 'ghostAcc');
+    this.bGhostRaw = this.buf(n * 16, S | CD | CS, 'ghostRaw');   // resolved, before ghost blur
     this.bGhost = this.buf(n * 16, S | CD | CS, 'ghost');
     this.bHaze = this.buf(n * 16, S | CD | CS, 'haze');
     this.bStar = this.buf(n * 16, S | CD | CS, 'starburst');
     this.bTmp = this.buf(n * 16, S | CD, 'tmp');
     this.device.queue.writeBuffer(this.bInput, 0, img.data);
     const enc = this.device.createCommandEncoder();
-    for (const b of [this.bGhost, this.bHaze, this.bStar]) enc.clearBuffer(b);
+    for (const b of [this.bGhostRaw, this.bGhost, this.bHaze, this.bStar]) enc.clearBuffer(b);
     this.device.queue.submit([enc.finish()]);
     this.displayBG = this.device.createBindGroup({
       layout: this.pDisplay.getBindGroupLayout(0),
@@ -122,20 +123,23 @@ export class FlareGPU {
   }
 
   /**
-   * Trace all (pair, source, pupil sample, wavelength) ghost rays.
-   * job: {lens, pairs:[{a,b,boost,est}], sources, grid:Float32Array(u,v..), spec:Float32Array, shw, shh,
-   *       blurRadius, blurPasses}
-   * Resolves the ghost buffer at gain 1 (the viewer applies Flare Gain).
+   * Trace all (pair, source, pupil sample, wavelength) ghost rays into the
+   * raw ghost buffer at gain 1 (the viewer applies Flare Gain); call
+   * blurGhost() afterwards to produce the displayed buffer.
+   * job: {lens, pairs:[{a,b,boost,est}], sources, grid:Float32Array(u,v..), spec:Float32Array, shw, shh}
    */
   async renderGhosts(job, { onProgress, isCancelled } = {}) {
     const d = this.device, q = d.queue;
-    const { lens, pairs, sources, grid, spec } = job;
+    const { lens, sources, grid, spec } = job;
+    // The kernel shares the forward segment between pairs, which needs (b, a) order.
+    const pairs = job.pairs.slice().sort((x, y) => x.b - y.b || x.a - y.a);
     const nGrid = grid.length / 2, nSpec = spec.length / 4, nSrc = sources.length, nPairs = pairs.length;
     const enc0 = d.createCommandEncoder();
     enc0.clearBuffer(this.bAcc);
-    enc0.clearBuffer(this.bGhost);
+    enc0.clearBuffer(this.bGhostRaw);
     q.submit([enc0.finish()]);
-    if (!nGrid || !nSrc || !nPairs) return { rays: 0 };
+    if (!nGrid || !nSrc || !nPairs) return { rays: 0, ms: 0 };
+    if (lens.n > 64 || lens.n * nSpec > 768) throw new Error(`lens has ${lens.n} surfaces (max 64)`);
 
     // Choose a power-of-two fixed-point scale so the worst case (every ray of
     // every pair and source landing on one pixel) cannot overflow 2^32.
@@ -146,7 +150,11 @@ export class FlareGPU {
     const bound = Math.max(srcSum * pairSum, 1e-30);
     const fixedScale = 2 ** Math.max(-60, Math.min(60, Math.floor(Math.log2(2e9 / bound))));
 
-    const surfs = this.storage(lens.packSurfaces(), 'surfs');
+    // Lens uniform: surf[64] = (radius, semi, z, coating), ior[k*n + s] per spectral sample.
+    const lensU = new Float32Array(64 * 4 + 192 * 4);
+    lens.surfaces.forEach((sf, i) => lensU.set([sf.radius, sf.semi, sf.z, sf.coating], i * 4));
+    for (let k = 0; k < nSpec; k++) for (let i = 0; i < lens.n; i++) lensU[256 + k * lens.n + i] = lens.iorAt(i, spec[k * 4]);
+    const uLens = this.uniform(lensU);
     const pairArr = new Float32Array(nPairs * 4);
     pairs.forEach((p, i) => pairArr.set([p.a, p.b, p.boost, 0], i * 4));
     const srcArr = new Float32Array(nSrc * 8);
@@ -154,36 +162,43 @@ export class FlareGPU {
     const bPairs = this.storage(pairArr, 'pairs'), bSrc = this.storage(srcArr, 'sources');
     const bGrid = this.storage(grid, 'grid'), bSpec = this.storage(spec, 'spec');
     const uBuf = this.buf(64, UNI, 'ghostU');
-    const bg = this.bind(this.pGhost, [uBuf, surfs, bPairs, bSrc, bGrid, bSpec, this.bAcc]);
+    const bg = this.bind(this.pGhost, [uBuf, uLens, bPairs, bSrc, bGrid, bSpec, this.bAcc]);
 
     const uData = new ArrayBuffer(64), uU = new Uint32Array(uData), uF = new Float32Array(uData);
-    uU[0] = lens.n; uU[1] = nGrid; uU[2] = nSpec; uU[3] = nSrc;
+    uU[0] = lens.n; uU[1] = nGrid; uU[2] = nSpec;
     uU[6] = this.w; uU[7] = this.h;
     uF[8] = lens.sensorZ; uF[9] = lens.surfaces[0].semi; uF[10] = lens.surfaces[0].z - 20;
     uF[11] = job.shw; uF[12] = job.shh; uF[13] = 1 / nGrid; uF[14] = fixedScale;
 
-    const totalCombos = nPairs * nSrc;
-    const perBatch = Math.max(1, Math.min(65535, Math.floor(3e6 / (nGrid * nSpec))));
-    const wgx = Math.ceil(nGrid / 64);
-    let done = 0, sinceSync = 0;
+    // Split into dispatches of ~budget traces (OS GPU watchdogs kill long
+    // dispatches): a block of sources x a block of pairs per dispatch.
+    const budget = this.batchTraces ?? 4e7;
+    const perSrcTraces = nGrid * nSpec;
+    const srcChunk = Math.max(1, Math.min(nSrc, 65535, Math.floor(budget / perSrcTraces)));
+    const pairChunk = Math.max(1, Math.floor(budget / (perSrcTraces * srcChunk)));
+    const wgx = Math.ceil(nGrid * nSpec / 64);
+    const total = nPairs * nSrc;
+    let done = 0, sinceSync = 0, cancelled = false;
     const t0 = performance.now();
-    while (done < totalCombos) {
-      if (isCancelled?.()) break;
-      const count = Math.min(perBatch, totalCombos - done);
-      uU[4] = done; uU[5] = count;
-      q.writeBuffer(uBuf, 0, uData);
-      const enc = d.createCommandEncoder();
-      const pass = enc.beginComputePass();
-      pass.setPipeline(this.pGhost); pass.setBindGroup(0, bg); pass.dispatchWorkgroups(wgx, count); pass.end();
-      q.submit([enc.finish()]);
-      done += count;
-      if (++sinceSync >= 2 || done >= totalCombos) {
-        sinceSync = 0;
-        await q.onSubmittedWorkDone();
-        onProgress?.(done / totalCombos);
+    outer:
+    for (let p0 = 0; p0 < nPairs; p0 += pairChunk) {
+      for (let s0 = 0; s0 < nSrc; s0 += srcChunk) {
+        if (isCancelled?.()) { cancelled = true; break outer; }
+        const pc = Math.min(pairChunk, nPairs - p0), sc = Math.min(srcChunk, nSrc - s0);
+        uU[3] = s0; uU[4] = p0; uU[5] = pc; uU[15] = sc;
+        q.writeBuffer(uBuf, 0, uData);
+        const enc = d.createCommandEncoder();
+        const pass = enc.beginComputePass();
+        pass.setPipeline(this.pGhost); pass.setBindGroup(0, bg); pass.dispatchWorkgroups(wgx, sc); pass.end();
+        q.submit([enc.finish()]);
+        done += pc * sc;
+        if (++sinceSync >= (this.syncEvery ?? 3) || done >= total) {
+          sinceSync = 0;
+          await q.onSubmittedWorkDone();
+          onProgress?.(done / total);
+        }
       }
     }
-    const cancelled = done < totalCombos;
     if (!cancelled) {
       const enc = d.createCommandEncoder();
       const ur = new ArrayBuffer(16);
@@ -191,14 +206,22 @@ export class FlareGPU {
       new Float32Array(ur, 8, 1)[0] = 1 / fixedScale;
       const uR = this.uniform(new Uint8Array(ur));
       const pass = enc.beginComputePass();
-      pass.setPipeline(this.pResolve); pass.setBindGroup(0, this.bind(this.pResolve, [uR, this.bAcc, this.bGhost]));
+      pass.setPipeline(this.pResolve); pass.setBindGroup(0, this.bind(this.pResolve, [uR, this.bAcc, this.bGhostRaw]));
       pass.dispatchWorkgroups(Math.ceil(this.n / 256)); pass.end();
-      this.encodeBlur(enc, this.bGhost, job.blurRadius, job.blurPasses);
       q.submit([enc.finish()]);
       await q.onSubmittedWorkDone();
     }
-    for (const b of [surfs, bPairs, bSrc, bGrid, bSpec, uBuf]) b.destroy();
+    for (const b of [uLens, bPairs, bSrc, bGrid, bSpec, uBuf]) b.destroy();
     return { cancelled, rays: done * nGrid * nSpec, ms: performance.now() - t0 };
+  }
+
+  // Displayed ghost buffer = raw ghosts blurred; cheap, so Ghost Blur changes don't re-trace.
+  async blurGhost(radius, passes) {
+    const enc = this.device.createCommandEncoder();
+    enc.copyBufferToBuffer(this.bGhostRaw, 0, this.bGhost, 0, this.bGhost.size);
+    this.encodeBlur(enc, this.bGhost, radius, passes);
+    this.device.queue.submit([enc.finish()]);
+    await this.device.queue.onSubmittedWorkDone();
   }
 
   // Haze seed from the source-block grid, then a wide blur (gain applied by viewer).
@@ -257,7 +280,7 @@ export class FlareGPU {
   }
 
   async read(which) {
-    const src = { ghost: this.bGhost, haze: this.bHaze, star: this.bStar }[which];
+    const src = { ghost: this.bGhost, ghostRaw: this.bGhostRaw, haze: this.bHaze, star: this.bStar }[which];
     const rb = this.device.createBuffer({ size: src.size, usage: GPUBufferUsage.MAP_READ | CD });
     const enc = this.device.createCommandEncoder();
     enc.copyBufferToBuffer(src, 0, rb, 0, src.size);

@@ -1,37 +1,36 @@
 // ============================================================================
 // shaders.js — WGSL kernels.
 //
-// ghostWGSL mirrors ghost_cuda.cu (and optics.js traceGhost) line for line.
 // WGSL has no float atomics, so the CUDA atomicAdd(float) splat is replaced
 // by a 64-bit fixed-point accumulator built from two u32 atomics with carry.
 // ============================================================================
 
+// The optics per surface are identical to trace.cpp / optics.js traceGhost,
+// but the work is organised differently from ghost_cuda.cu: one invocation
+// handles one (source, pupil sample, wavelength) and walks every ghost pair
+// sorted by (b, a). The forward segment through surfaces 0..b-1 is shared by
+// all pairs with the same or larger b, so it is traced once and extended
+// incrementally; once it is vignetted, every remaining pair is dead too.
 export const ghostWGSL = /* wgsl */ `
-struct Surf { radius: f32, thick: f32, ior: f32, abbe: f32, semi: f32, coating: f32, z: f32, pad: f32 };
 struct U {
-  nSurf: u32, nGrid: u32, nSpec: u32, nSrc: u32,
-  comboBase: u32, comboCount: u32, width: u32, height: u32,
+  nSurf: u32, nGrid: u32, nSpec: u32, srcBase: u32,
+  pairBase: u32, pairCount: u32, width: u32, height: u32,
   sensorZ: f32, frontR: f32, startZ: f32, shw: f32,
-  shh: f32, rayWeight: f32, fixedScale: f32, pad: f32,
+  shh: f32, rayWeight: f32, fixedScale: f32, srcCount: u32,
 };
+// surf[s] = (radius, semi_aperture, z, coating); ior[] = IOR after surface s
+// at spectral sample k, flattened as k * nSurf + s (precomputed on the CPU).
+struct LensU { surf: array<vec4f, 64>, ior: array<vec4f, 192> };
 @group(0) @binding(0) var<uniform> u: U;
-@group(0) @binding(1) var<storage, read> surfs: array<Surf>;
-@group(0) @binding(2) var<storage, read> pairs: array<vec4f>;   // a, b, area_boost, -
+@group(0) @binding(1) var<uniform> L: LensU;
+@group(0) @binding(2) var<storage, read> pairs: array<vec4f>;   // a, b, area_boost, - (sorted by b, a)
 @group(0) @binding(3) var<storage, read> srcs: array<vec4f>;    // [2i]=(ax, ay, -, -) [2i+1]=(r, g, b, -)
 @group(0) @binding(4) var<storage, read> grid: array<vec2f>;
 @group(0) @binding(5) var<storage, read> spec: array<vec4f>;    // lambda, rw, gw, bw
 @group(0) @binding(6) var<storage, read_write> acc: array<atomic<u32>>;
 
-fn dispersion(nd: f32, vd: f32, l: f32) -> f32 {
-  if (vd < 0.1 || nd <= 1.0001) { return nd; }
-  let lF = 486.13; let lC = 656.27; let ld = 587.56;
-  let dn = (nd - 1.0) / vd;
-  let B = dn / (1.0 / (lF * lF) - 1.0 / (lC * lC));
-  let A = nd - B / (ld * ld);
-  return A + B / (l * l);
-}
-fn iorAt(s: u32, l: f32) -> f32 { return dispersion(surfs[s].ior, surfs[s].abbe, l); }
-fn iorBefore(s: u32, l: f32) -> f32 { if (s == 0u) { return 1.0; } return iorAt(s - 1u, l); }
+fn iorAfter(s: u32, k: u32) -> f32 { let i = k * u.nSurf + s; return L.ior[i / 4u][i % 4u]; }
+fn iorBefore(s: u32, k: u32) -> f32 { if (s == 0u) { return 1.0; } return iorAfter(s - 1u, k); }
 
 fn fresnel(ci: f32, n1: f32, n2: f32) -> f32 {
   let c = abs(ci);
@@ -68,18 +67,18 @@ fn surfR(ci: f32, n1: f32, n2: f32, layers: i32, l: f32) -> f32 {
 struct Hit { p: vec3f, n: vec3f, ok: bool };
 fn intersect(o: vec3f, d: vec3f, s: u32) -> Hit {
   var h: Hit; h.ok = false;
-  let sf = surfs[s];
-  if (abs(sf.radius) < 1e-6) {
+  let sf = L.surf[s];
+  let R = sf.x; let semi = sf.y; let z = sf.z;
+  if (abs(R) < 1e-6) {
     if (abs(d.z) < 1e-12) { return h; }
-    let t = (sf.z - o.z) / d.z;
+    let t = (z - o.z) / d.z;
     if (!(t > 1e-6)) { return h; }
     h.p = o + d * t;
-    if (!(dot(h.p.xy, h.p.xy) <= sf.semi * sf.semi)) { return h; }
+    if (!(dot(h.p.xy, h.p.xy) <= semi * semi)) { return h; }
     h.n = vec3f(0.0, 0.0, select(1.0, -1.0, d.z > 0.0));
     h.ok = true; return h;
   }
-  let R = sf.radius;
-  let c = vec3f(0.0, 0.0, sf.z + R);
+  let c = vec3f(0.0, 0.0, z + R);
   let oc = o - c;
   let a = dot(d, d);
   let b = 2.0 * dot(oc, d);
@@ -93,12 +92,12 @@ fn intersect(o: vec3f, d: vec3f, s: u32) -> Hit {
   var t: f32;
   if (t1 > 1e-6 && t2 > 1e-6) {
     let z1 = o.z + t1 * d.z; let z2 = o.z + t2 * d.z;
-    t = select(t2, t1, abs(z1 - sf.z) < abs(z2 - sf.z));
+    t = select(t2, t1, abs(z1 - z) < abs(z2 - z));
   } else if (t1 > 1e-6) { t = t1; }
   else if (t2 > 1e-6) { t = t2; }
   else { return h; }
   h.p = o + d * t;
-  if (!(dot(h.p.xy, h.p.xy) <= sf.semi * sf.semi)) { return h; }
+  if (!(dot(h.p.xy, h.p.xy) <= semi * semi)) { return h; }
   var n = (h.p - c) / abs(R);
   if (dot(n, d) > 0.0) { n = -n; }
   h.n = n; h.ok = true; return h;
@@ -121,56 +120,23 @@ fn refractD(d: vec3f, n: vec3f, eta: f32) -> Dir {
 }
 fn reflectD(d: vec3f, n: vec3f) -> Dir { return safeNorm(d - n * (2.0 * dot(d, n))); }
 
-struct Trace { pos: vec2f, w: f32, ok: bool };
-fn traceGhost(o0: vec3f, d0: vec3f, a: u32, b: u32, l: f32) -> Trace {
-  var tr: Trace; tr.ok = false;
-  var o = o0; var d = d0; var ior = 1.0; var w = 1.0;
-  // Phase 1: forward 0..b, reflect at b
-  for (var s = 0u; s <= b; s++) {
-    let h = intersect(o, d, s);
-    if (!h.ok) { return tr; }
-    o = h.p;
-    let n2 = iorAt(s, l);
-    let R = surfR(abs(dot(h.n, d)), ior, n2, i32(surfs[s].coating), l);
-    if (s == b) {
-      let r = reflectD(d, h.n); if (!r.ok) { return tr; }
-      d = r.d; w *= R;
-    } else {
-      let r = refractD(d, h.n, ior / n2); if (!r.ok) { return tr; }
-      d = r.d; w *= 1.0 - R; ior = n2;
-    }
+struct Ray { o: vec3f, d: vec3f, ior: f32, w: f32 };
+// Intersect surface s, then reflect (weight *= R) or refract into medium n2 (weight *= 1 - R).
+fn interact(r: ptr<function, Ray>, s: u32, n2: f32, l: f32, refl: bool) -> bool {
+  let h = intersect((*r).o, (*r).d, s);
+  if (!h.ok) { return false; }
+  (*r).o = h.p;
+  let R = surfR(abs(dot(h.n, (*r).d)), (*r).ior, n2, i32(L.surf[s].w), l);
+  if (refl) {
+    let q = reflectD((*r).d, h.n);
+    if (!q.ok) { return false; }
+    (*r).d = q.d; (*r).w *= R;
+  } else {
+    let q = refractD((*r).d, h.n, (*r).ior / n2);
+    if (!q.ok) { return false; }
+    (*r).d = q.d; (*r).w *= 1.0 - R; (*r).ior = n2;
   }
-  // Phase 2: backward b-1..a, reflect at a
-  for (var si = i32(b) - 1; si >= i32(a); si--) {
-    let s = u32(si);
-    let h = intersect(o, d, s);
-    if (!h.ok) { return tr; }
-    o = h.p;
-    let n2 = iorBefore(s, l);
-    let R = surfR(abs(dot(h.n, d)), ior, n2, i32(surfs[s].coating), l);
-    if (s == a) {
-      let r = reflectD(d, h.n); if (!r.ok) { return tr; }
-      d = r.d; w *= R; ior = iorAt(a, l);
-    } else {
-      let r = refractD(d, h.n, ior / n2); if (!r.ok) { return tr; }
-      d = r.d; w *= 1.0 - R; ior = n2;
-    }
-  }
-  // Phase 3: forward a+1..N-1
-  for (var s = a + 1u; s < u.nSurf; s++) {
-    let h = intersect(o, d, s);
-    if (!h.ok) { return tr; }
-    o = h.p;
-    let n2 = iorAt(s, l);
-    let R = surfR(abs(dot(h.n, d)), ior, n2, i32(surfs[s].coating), l);
-    let r = refractD(d, h.n, ior / n2); if (!r.ok) { return tr; }
-    d = r.d; w *= 1.0 - R; ior = n2;
-  }
-  if (abs(d.z) < 1e-12) { return tr; }
-  let t = (u.sensorZ - o.z) / d.z;
-  if (!(t > 0.0)) { return tr; }
-  tr.pos = (o + d * t).xy; tr.w = w; tr.ok = true;
-  return tr;
+  return true;
 }
 
 // 64-bit fixed-point add: acc[2i] = integer part, acc[2i+1] = fraction * 2^32
@@ -192,31 +158,58 @@ fn splat(x: i32, y: i32, c: vec3f, wt: f32) {
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(workgroup_id) wid: vec3u) {
-  let gi = gid.x;
-  if (gi >= u.nGrid || wid.y >= u.comboCount) { return; }
-  let combo = u.comboBase + wid.y;
-  let pairIdx = combo / u.nSrc;
-  let srcIdx = combo % u.nSrc;
-  let pr = pairs[pairIdx];
-  let a = u32(pr.x); let b = u32(pr.y);
-  if (b <= a || b >= u.nSurf) { return; }
-  let sa = srcs[srcIdx * 2u];
-  let sc = srcs[srcIdx * 2u + 1u].rgb;
-  let dir = normalize(vec3f(tan(sa.x), tan(sa.y), 1.0));
-  let g = grid[gi];
-  let org = vec3f(g.x * u.frontR, g.y * u.frontR, u.startZ);
-  for (var k = 0u; k < u.nSpec; k++) {
-    let sp = spec[k];
-    let r = traceGhost(org, dir, a, b, sp.x);
-    if (!r.ok) { continue; }
+  if (gid.x >= u.nGrid * u.nSpec || wid.y >= u.srcCount) { return; }
+  let k = gid.x / u.nGrid;
+  let gs = grid[gid.x % u.nGrid];
+  let sp = spec[k];
+  let si = u.srcBase + wid.y;
+  let sa = srcs[si * 2u];
+  let col = srcs[si * 2u + 1u].rgb * sp.yzw;
+  var fwd: Ray;
+  fwd.o = vec3f(gs.x * u.frontR, gs.y * u.frontR, u.startZ);
+  fwd.d = normalize(vec3f(tan(sa.x), tan(sa.y), 1.0));
+  fwd.ior = 1.0;
+  fwd.w = 1.0;
+  var fidx = 0u;   // surfaces 0..fidx-1 already transmitted by fwd
+
+  for (var p = u.pairBase; p < u.pairBase + u.pairCount; p++) {
+    let pr = pairs[p];
+    let a = u32(pr.x); let b = u32(pr.y);
+    // Phase 1 (shared between pairs): transmit up to surface b-1.
+    var dead = false;
+    loop {
+      if (fidx >= b) { break; }
+      if (!interact(&fwd, fidx, iorAfter(fidx, k), sp.x, false)) { dead = true; break; }
+      fidx++;
+    }
+    if (dead) { break; }   // sorted by b: every remaining pair needs this segment
+    var r = fwd;
+    // Reflect at b.
+    if (!interact(&r, b, iorAfter(b, k), sp.x, true)) { continue; }
+    // Phase 2: backward b-1..a, reflect at a.
+    var ok = true;
+    for (var s2 = i32(b) - 1; s2 >= i32(a); s2--) {
+      let s = u32(s2);
+      if (!interact(&r, s, iorBefore(s, k), sp.x, s == a)) { ok = false; break; }
+      if (s == a) { r.ior = iorAfter(a, k); }
+    }
+    if (!ok) { continue; }
+    // Phase 3: forward a+1..N-1.
+    for (var s = a + 1u; s < u.nSurf; s++) {
+      if (!interact(&r, s, iorAfter(s, k), sp.x, false)) { ok = false; break; }
+    }
+    if (!ok || abs(r.d.z) < 1e-12) { continue; }
+    let t = (u.sensorZ - r.o.z) / r.d.z;
+    if (!(t > 0.0)) { continue; }
+    let pos = (r.o + r.d * t).xy;
     let base = r.w * u.rayWeight * pr.z;
     if (base < 1e-20) { continue; }
-    let px = (r.pos.x / (2.0 * u.shw) + 0.5) * f32(u.width);
-    let py = (r.pos.y / (2.0 * u.shh) + 0.5) * f32(u.height);
+    let px = (pos.x / (2.0 * u.shw) + 0.5) * f32(u.width);
+    let py = (pos.y / (2.0 * u.shh) + 0.5) * f32(u.height);
     if (!(abs(px) < 1e8 && abs(py) < 1e8)) { continue; }   // also rejects NaN
     let x0 = i32(floor(px - 0.5)); let y0 = i32(floor(py - 0.5));
     let fx = (px - 0.5) - f32(x0); let fy = (py - 0.5) - f32(y0);
-    let c = sc * sp.yzw * base;
+    let c = col * base;
     splat(x0, y0, c, (1.0 - fx) * (1.0 - fy));
     splat(x0 + 1, y0, c, fx * (1.0 - fy));
     splat(x0, y0 + 1, c, (1.0 - fx) * fy);

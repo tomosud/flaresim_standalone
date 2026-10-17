@@ -23,6 +23,7 @@
     <button id="btnExr" class="btn primary">EXR 書き出し</button>
     <button id="btnPng" class="btn">PNG 書き出し</button>
   </div>
+  <div class="hdrstat" id="gpuStat"></div>
   <div class="hdrstat" id="hdrStat"></div>
 </header>
 
@@ -41,6 +42,7 @@
         <option value="5">Sources</option>
       </select>
       <label class="inline">EV <input id="exposure" type="range" min="-10" max="10" step="0.1" value="0"><output id="exposureOut">0.0</output></label>
+      <label class="inline" title="入力画像（背景）の表示 [B]。オフで書き出すとフレアだけの RGB になります"><input id="bgOn" type="checkbox" checked> 背景</label>
       <label class="inline" title="HDR ディスプレイで 1.0 を超える輝度をそのまま表示"><input id="hdrOn" type="checkbox"> HDR</label>
       <select id="tonemap" title="SDR 表示時のトーンマップ">
         <option value="2">ACES</option><option value="1">Reinhard</option><option value="0">Clamp</option>

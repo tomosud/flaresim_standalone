@@ -72,7 +72,7 @@ const P = {
 const STORE = 'flaresim-web-v1';
 const state = {};
 for (const [k, d] of Object.entries(P)) state[k] = d.def;
-const view = { exposure: 0, mode: 0, hdr: false, tonemap: 2, zoom: 1, offX: 0, offY: 0 };
+const view = { exposure: 0, mode: 0, hdr: false, tonemap: 2, bg: true, zoom: 1, offX: 0, offY: 0 };
 try {
   const saved = JSON.parse(localStorage.getItem(STORE) || '{}');
   for (const k of Object.keys(P)) if (k in (saved.p || {})) state[k] = saved.p[k];
@@ -81,7 +81,7 @@ try {
 } catch { /* storage unavailable */ }
 function persist() {
   try {
-    localStorage.setItem(STORE, JSON.stringify({ p: Object.fromEntries(Object.keys(P).map(k => [k, state[k]])), v: { exposure: view.exposure, mode: view.mode, hdr: view.hdr, tonemap: view.tonemap }, lensFile: lens?.file }));
+    localStorage.setItem(STORE, JSON.stringify({ p: Object.fromEntries(Object.keys(P).map(k => [k, state[k]])), v: { exposure: view.exposure, mode: view.mode, hdr: view.hdr, tonemap: view.tonemap, bg: view.bg }, lensFile: lens?.file }));
   } catch { /* ignore */ }
 }
 
@@ -171,10 +171,10 @@ function setParam(key, v, dragging = false) {
   persist();
   // Gains only rescale cached buffers; the render pass is a no-op unless a
   // component (e.g. haze going from 0 to >0) has never been computed.
-  if (P[key].live) { draw(); scheduleRender(dragging ? 250 : 60); return; }
+  if (P[key].live) { draw(); scheduleRender(dragging ? 150 : 60, dragging); return; }
   if (key.startsWith('exr')) return;
   if (key.startsWith('manual')) drawOverlay();
-  scheduleRender(dragging ? 250 : 60);
+  scheduleRender(dragging ? 80 : 60, dragging);
 }
 
 // ---------------------------------------------------------------------------
@@ -240,13 +240,16 @@ function camera(w, h) {
   }
   return { fh, fv, tanH: Math.tan(fh / 2), tanV: Math.tan(fv / 2) };
 }
-function eff() {
-  const pv = state.preview;
+// interactive: while a slider / the light is being dragged, trace with the
+// preview ray grid and spectral count, but keep the final source detection so
+// the image does not jump when the full-quality render replaces it.
+function eff(interactive = false) {
+  const pv = state.preview, fast = pv || interactive;
   return {
-    rayGrid: pv ? state.pvRayGrid : state.rayGrid,
+    rayGrid: fast ? Math.min(state.pvRayGrid, state.rayGrid) : state.rayGrid,
     maxSources: pv ? state.pvMaxSources : state.maxSources,
     downsample: pv ? state.pvDownsample : state.downsample,
-    spectral: pv ? state.pvSpectral : state.spectral,
+    spectral: fast ? Math.min(state.pvSpectral, state.spectral) : state.spectral,
     dsRatio: pv ? state.pvDownsample / Math.max(state.downsample, 1) : 1,
   };
 }
@@ -257,13 +260,14 @@ const hexRGB = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16) / 255).ma
 // ---------------------------------------------------------------------------
 let gpu = null, image = null;
 let lastSources = [], sourceInfo = { total: 0 };
-const keys = { src: '', ghost: '', haze: '', star: '' };
+const keys = { src: '', ghost: '', blur: '', haze: '', star: '' };
 let psfCache = { key: '', psf: null };
-let renderTimer = 0, rendering = false, rerender = false, generation = 0;
+let renderTimer = 0, rendering = false, rerender = false, generation = 0, interactiveRender = false;
 
-function scheduleRender(delay = 60) {
+function scheduleRender(delay = 60, interactive = false) {
   clearTimeout(renderTimer);
   generation++;
+  interactiveRender = interactive;
   renderTimer = setTimeout(() => runRender(), delay);
 }
 
@@ -271,7 +275,7 @@ async function runRender() {
   if (rendering) { rerender = true; return; }
   rendering = true;
   try {
-    do { rerender = false; await renderOnce(generation); } while (rerender);
+    do { rerender = false; await renderOnce(generation, interactiveRender); } while (rerender);
   } catch (e) {
     console.error(e);
     setStatus('エラー: ' + e.message, true);
@@ -279,12 +283,12 @@ async function runRender() {
   rendering = false;
 }
 
-async function renderOnce(gen) {
+async function renderOnce(gen, interactive) {
   if (!gpu || !image || !lens) return;
   const cancelled = () => gen !== generation;
   const { width: w, height: h } = image;
   const cam = camera(w, h);
-  const e = eff();
+  const e = eff(interactive);
   const t0 = performance.now();
 
   // 1. sources
@@ -314,21 +318,25 @@ async function renderOnce(gen) {
   const active = pairsCache.pairs.filter(p => pairEnabled.get(p.a + '-' + p.b) !== false);
 
   // 3. ghosts
-  const ghostKey = JSON.stringify([srcKey, pairKey, active.map(p => p.a * 1000 + p.b), e.rayGrid, e.spectral, state.pupilJitter, state.jitterSeed, state.blades, state.rotation, state.ghostBlur, state.ghostBlurPasses]);
+  const ghostKey = JSON.stringify([srcKey, pairKey, active.map(p => p.a * 1000 + p.b), e.rayGrid, e.spectral, state.pupilJitter, state.jitterSeed, state.blades, state.rotation]);
   let ghostStats = null;
   if (ghostKey !== keys.ghost) {
     const grid = buildPupil(e.rayGrid, state.blades, state.rotation, state.pupilJitter, state.jitterSeed);
     const spec = buildSpectrum(e.spectral);
-    const diag = Math.hypot(w, h);
     setStatus(`ゴースト追跡中… ${active.length} pairs × ${lastSources.length} sources × ${grid.length / 2} rays × ${spec.length / 4} λ`);
     setProgress(0);
     ghostStats = await gpu.renderGhosts({
       lens, pairs: active, sources: lastSources, grid, spec, shw, shh,
-      blurRadius: state.ghostBlur > 0 ? Math.max(1, Math.round(state.ghostBlur * diag)) : 0, blurPasses: state.ghostBlurPasses,
     }, { onProgress: setProgress, isCancelled: cancelled });
     setProgress(null);
     if (ghostStats.cancelled || cancelled()) return;
     keys.ghost = ghostKey;
+  }
+  const blurKey = JSON.stringify([keys.ghost, state.ghostBlur, state.ghostBlurPasses]);
+  if (blurKey !== keys.blur) {
+    const radius = state.ghostBlur > 0 ? Math.max(1, Math.round(state.ghostBlur * Math.hypot(w, h))) : 0;
+    await gpu.blurGhost(radius, state.ghostBlurPasses);
+    keys.blur = blurKey;
   }
 
   // 4. haze
@@ -360,8 +368,9 @@ async function renderOnce(gen) {
   drawDiagram();
   const ms = performance.now() - t0;
   const capped = sourceInfo.total > lastSources.length ? ` (cap ${sourceInfo.total}→${lastSources.length})` : '';
-  const rays = ghostStats ? ` · ${(ghostStats.rays / 1e6).toFixed(1)} M traces` : '';
-  setStatus(`${w}×${h} · ${lastSources.length} sources${capped} · ${active.length}/${pairsCache.pairs.length} pairs${rays} · ${ms.toFixed(0)} ms${state.preview ? ' · PREVIEW' : ''}`);
+  const rays = ghostStats ? ` · ${(ghostStats.rays / 1e6).toFixed(0)} M rays (GPU ${ghostStats.ms.toFixed(0)} ms)` : '';
+  const mode = state.preview ? ' · PREVIEW' : interactive ? ' · 操作中は簡易表示' : '';
+  setStatus(`${w}×${h} · ${lastSources.length} sources${capped} · ${active.length}/${pairsCache.pairs.length} pairs${rays} · total ${ms.toFixed(0)} ms${mode}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -450,7 +459,7 @@ function draw() {
     const e = eff();
     gpu.draw({
       offX: view.offX, offY: view.offY, zoom: view.zoom, exposure: 2 ** view.exposure,
-      inputGain: 2 ** state.inputEV, ghostGain: state.flareGain * e.dsRatio * e.dsRatio,
+      inputGain: view.bg || view.mode === 5 ? 2 ** state.inputEV : 0, ghostGain: state.flareGain * e.dsRatio * e.dsRatio,
       hazeGain: state.hazeGain, starGain: state.starGain, hdrScale: 1,
       mode: view.mode, tonemap: view.tonemap, hdr: view.hdr,
     });
@@ -519,7 +528,7 @@ function moveLight(cx, cy, dragging) {
   state.manualY = Math.round((cy - view.offY) / view.zoom);
   widgets.manualX.set(state.manualX); widgets.manualY.set(state.manualY);
   refreshEnables(); persist(); drawOverlay();
-  scheduleRender(dragging ? 120 : 0);
+  scheduleRender(dragging ? 40 : 0, dragging);
 }
 
 function probe(cx, cy) {
@@ -591,7 +600,8 @@ async function composeLinear() {
   const n = image.width * image.height, e = eff();
   const gg = state.flareGain * e.dsRatio * e.dsRatio, hg = state.hazeGain, sg = state.starGain, ig = 2 ** state.inputEV;
   const [ghost, haze, star] = await Promise.all([gpu.read('ghost'), gpu.read('haze'), gpu.read('star')]);
-  const out = new Float32Array(n * 4), inp = image.data, m = view.mode;
+  // Composite without the background plate is the same as Flare only.
+  const out = new Float32Array(n * 4), inp = image.data, m = view.mode === 0 && !view.bg ? 1 : view.mode;
   for (let i = 0; i < n * 4; i += 4) {
     for (let c = 0; c < 3; c++) {
       const G = ghost[i + c] * gg, H = haze[i + c] * hg, Sb = star[i + c] * sg, I = inp[i + c] * ig;
@@ -599,16 +609,17 @@ async function composeLinear() {
     }
     out[i + 3] = m === 0 || m === 5 ? inp[i + 3] : 1;
   }
-  return { out, ghost, haze, star, gg, hg, sg };
+  return { out, ghost, haze, star, gg, hg, sg, hasAlpha: m === 0 || m === 5 };
 }
 
 $('btnExr').onclick = async () => {
   if (!image) return;
   try {
     setStatus('EXR を書き出し中…'); setProgress(0);
-    const { out, ghost, haze, star, gg, hg, sg } = await composeLinear();
+    const { out, ghost, haze, star, gg, hg, sg, hasAlpha } = await composeLinear();
     const n = image.width * image.height;
-    const chans = ['R', 'G', 'B', 'A'].map((name, c) => ({ name, data: out, stride: 4, offset: c }));
+    // Without the background plate the flare is additive light: RGB only, no alpha.
+    const chans = (hasAlpha ? ['R', 'G', 'B', 'A'] : ['R', 'G', 'B']).map((name, c) => ({ name, data: out, stride: 4, offset: c }));
     if (state.exrLayers) {
       const layer = (pre, buf, k) => {
         const d = new Float32Array(n * 4);
@@ -663,6 +674,9 @@ function initViewControls() {
   ex.ondblclick = () => { ex.value = 0; ex.oninput(); };
   $('outputMode').value = view.mode;
   $('outputMode').onchange = ev => { view.mode = Number(ev.target.value); persist(); draw(); };
+  const bgCb = $('bgOn');
+  bgCb.checked = view.bg;
+  bgCb.onchange = () => { view.bg = bgCb.checked; persist(); draw(); };
   $('tonemap').value = view.tonemap;
   $('tonemap').onchange = ev => { view.tonemap = Number(ev.target.value); persist(); draw(); };
   const mq = matchMedia('(dynamic-range: high)');
@@ -682,9 +696,22 @@ function initViewControls() {
   window.addEventListener('keydown', ev => {
     if (ev.target.matches('input, select, textarea')) return;
     if (ev.key === 'f') fitView();
+    if (ev.key === 'b') { view.bg = !view.bg; $('bgOn').checked = view.bg; persist(); draw(); }
     if (ev.key === 'p') { setParam('preview', !state.preview); widgets.preview.set(state.preview); }
     if (ev.key >= '1' && ev.key <= '6') { view.mode = Number(ev.key) - 1; $('outputMode').value = view.mode; draw(); }
   });
+}
+
+function showGpuInfo(adapter) {
+  const i = adapter.info || {};
+  const name = [i.vendor, i.architecture, i.description].filter(Boolean).join(' ') || 'unknown GPU';
+  const el = $('gpuStat');
+  el.textContent = 'GPU: ' + name;
+  const weak = i.isFallbackAdapter || /intel|swiftshader|llvmpipe|microsoft/i.test(name);
+  el.classList.toggle('warn', weak);
+  el.title = weak
+    ? '内蔵 GPU またはソフトウェア描画の可能性があります。Windows の「設定 → ディスプレイ → グラフィック」でブラウザを「高パフォーマンス」にすると外付け GPU で動きます。'
+    : 'WebGPU で使用中のアダプタ';
 }
 
 // ---------------------------------------------------------------------------
@@ -696,6 +723,7 @@ async function boot() {
   new ResizeObserver(resizeCanvas).observe(viewer);
   try {
     gpu = await FlareGPU.create(canvas);
+    showGpuInfo(gpu.adapter);
     gpu.lost.then(info => setStatus('GPU デバイスが失われました: ' + info.message + '（ページを再読み込みしてください）', true));
   } catch (e) {
     setStatus('WebGPU を初期化できません: ' + e.message + ' — Chrome / Edge 113 以降が必要です。', true);
