@@ -17,6 +17,7 @@ struct U {
   pairBase: u32, pairCount: u32, width: u32, height: u32,
   sensorZ: f32, frontR: f32, startZ: f32, shw: f32,
   shh: f32, rayWeight: f32, fixedScale: f32, srcCount: u32,
+  passIdx: u32, areaSample: u32, pad0: u32, pad1: u32,
 };
 // surf[s] = (radius, semi_aperture, z, coating); ior[] = IOR after surface s
 // at spectral sample k, flattened as k * nSurf + s (precomputed on the CPU).
@@ -24,10 +25,18 @@ struct LensU { surf: array<vec4f, 64>, ior: array<vec4f, 192> };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var<uniform> L: LensU;
 @group(0) @binding(2) var<storage, read> pairs: array<vec4f>;   // a, b, area_boost, - (sorted by b, a)
-@group(0) @binding(3) var<storage, read> srcs: array<vec4f>;    // [2i]=(ax, ay, -, -) [2i+1]=(r, g, b, -)
+// [2i] = (angle_x, angle_y, extent_x, extent_y)  extents are half-sizes in tan(angle) units
+// [2i+1] = (r, g, b, shape)  shape 0 = square block, 1 = disc
+@group(0) @binding(3) var<storage, read> srcs: array<vec4f>;
 @group(0) @binding(4) var<storage, read> grid: array<vec2f>;
 @group(0) @binding(5) var<storage, read> spec: array<vec4f>;    // lambda, rw, gw, bw
 @group(0) @binding(6) var<storage, read_write> acc: array<atomic<u32>>;
+
+fn wang(x: u32) -> u32 {
+  var s = (x ^ 61u) ^ (x >> 16u);
+  s *= 9u; s = s ^ (s >> 4u); s *= 0x27d4eb2du; s = s ^ (s >> 15u);
+  return s;
+}
 
 fn iorAfter(s: u32, k: u32) -> f32 { let i = k * u.nSurf + s; return L.ior[i / 4u][i % 4u]; }
 fn iorBefore(s: u32, k: u32) -> f32 { if (s == 0u) { return 1.0; } return iorAfter(s - 1u, k); }
@@ -164,10 +173,23 @@ fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(workgroup_id) wid: v
   let sp = spec[k];
   let si = u.srcBase + wid.y;
   let sa = srcs[si * 2u];
-  let col = srcs[si * 2u + 1u].rgb * sp.yzw;
+  let sc = srcs[si * 2u + 1u];
+  let col = sc.rgb * sp.yzw;
+  // Area sampling (extension): each ray leaves from a random point of the
+  // source's footprint (detected block or light disc) instead of its centre,
+  // so an extended source gives a smooth ghost blurred by its true size.
+  var t = vec2f(tan(sa.x), tan(sa.y));
+  if (u.areaSample == 1u && (sa.z > 0.0 || sa.w > 0.0)) {
+    let h1 = wang(gid.x * 9781u + si * 6271u + u.passIdx * 26699u + 1u);
+    let h2 = wang(h1 ^ 0x9e3779b9u);
+    let r1 = f32(h1) * 2.3283064e-10; let r2 = f32(h2) * 2.3283064e-10;
+    var o = vec2f(r1, r2) * 2.0 - 1.0;
+    if (sc.w > 0.5) { let rr = sqrt(r1); let ang = 6.2831853 * r2; o = vec2f(rr * cos(ang), rr * sin(ang)); }
+    t += o * sa.zw;
+  }
   var fwd: Ray;
   fwd.o = vec3f(gs.x * u.frontR, gs.y * u.frontR, u.startZ);
-  fwd.d = normalize(vec3f(tan(sa.x), tan(sa.y), 1.0));
+  fwd.d = normalize(vec3f(t, 1.0));
   fwd.ior = 1.0;
   fwd.w = 1.0;
   var fidx = 0u;   // surfaces 0..fidx-1 already transmitted by fwd
@@ -323,7 +345,9 @@ struct U {
   imgW: f32, imgH: f32, offX: f32, offY: f32,
   zoom: f32, exposure: f32, inputGain: f32, ghostGain: f32,
   hazeGain: f32, starGain: f32, hdrScale: f32, gScale: f32,
-  mode: u32, tonemap: u32, hdr: u32, pad1: u32,
+  mode: u32, tonemap: u32, hdr: u32, showLight: u32,
+  light: vec4f,      // x, y, radius (px), -
+  lightRGB: vec4f,   // scene-linear radiance of the light disc
 };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var<storage, read> inputBuf: array<vec4f>;
@@ -369,14 +393,21 @@ fn aces(x: vec3f) -> vec3f {
   let gh = ghostAt(ip) * u.ghostGain;
   let hz = haze[i].rgb * u.hazeGain;
   let sb = star[i].rgb * u.starGain;
+  // The light point (manual light) is a viewer-only layer: it is never part
+  // of the flare buffers, so exports contain the flare without the emitter.
+  var lp = vec3f(0.0);
+  if (u.showLight == 1u && (u.mode == 0u || u.mode == 5u)) {
+    let cov = clamp(u.light.z - length(ip - u.light.xy) + 0.5, 0.0, 1.0);
+    lp = u.lightRGB.rgb * cov;
+  }
   var c: vec3f;
   switch (u.mode) {
-    case 0u: { c = inp + gh + hz + sb; }
+    case 0u: { c = inp + gh + hz + sb + lp; }
     case 1u: { c = gh + hz + sb; }
     case 2u: { c = gh; }
     case 3u: { c = hz; }
     case 4u: { c = sb; }
-    default: { c = inp; }
+    default: { c = inp + lp; }
   }
   c = max(c * u.exposure, vec3f(0.0));
   if (u.hdr == 1u) {

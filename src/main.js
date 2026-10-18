@@ -6,7 +6,7 @@ import { detectSources } from './sources.js';
 import { computeStarburstPSF } from './starburst.js';
 import { FlareGPU } from './gpu.js';
 import { writeEXR } from './exr.js';
-import { loadImageFile, makeTestScene } from './imageio.js';
+import { loadImageFile, makeTestScene, makeBlank } from './imageio.js';
 import { drawLensDiagram } from './diagram.js';
 
 const $ = id => document.getElementById(id);
@@ -27,10 +27,11 @@ const P = {
   rayGrid: { label: 'Ray Grid (NxN)', type: 'int', min: 4, max: 256, step: 1, def: 64, hint: '入射瞳のサンプル数（一辺）。N² 本の光線' },
   pupilJitter: { label: 'Pupil Sampling', type: 'select', options: [['Grid', 0], ['Stratified', 1], ['Halton', 2], ['Golden angle', 3]], def: 2, hint: 'Grid は低レイ数でドット模様が出やすい。Halton / Golden angle 推奨' },
   jitterSeed: { label: 'Jitter Seed', type: 'int', min: 0, max: 9999, step: 1, def: 0 },
-  passes: { label: 'Progressive passes', type: 'int', min: 1, max: MAX_PASSES, step: 1, def: 8, hint: '描画後も手を止めている間、瞳サンプルをずらした計算を足して平均し、点々を減らしていく回数（1 = オフ）' },
+  areaSample: { label: 'Area sampling (光源の大きさで光線を散らす)', type: 'check', def: true, hint: '光線ごとに光源の範囲（検出ブロック / 光点の円盤）内のランダムな位置から出す拡張機能。光源の大きさのぶんゴーストが滑らかにボケます。オフで原典と同じ点光源' },
+  passes: { label: 'Progressive passes', type: 'int', min: 1, max: MAX_PASSES, step: 1, def: 32, hint: '描画後も手を止めている間、瞳サンプルをずらした計算を足して平均し、点々を減らしていく回数（1 = オフ）' },
   spectral: { label: 'Spectral Samples', type: 'select', options: SPECTRAL, def: 3 },
   detect: { label: 'Detect bright sources', type: 'check', def: true },
-  threshold: { label: 'Threshold', type: 'range', min: 0.1, max: 1000, step: 0.01, def: 2, log: true, hint: 'シーンリニア輝度のしきい値' },
+  threshold: { label: 'Threshold', type: 'range', min: 0.1, max: 100000, step: 0.01, def: 2, log: true, hint: 'シーンリニア輝度のしきい値。スポイトで画像から選べます' },
   inputEV: { label: 'Input EV', type: 'range', min: -8, max: 8, step: 0.1, def: 0, hint: '入力画像の露出補正（検出と表示の両方）' },
   sourceCap: { label: 'Source Cap (0=off)', type: 'range', min: 0, max: 100000, step: 1, def: 0, log: true },
   maxSources: { label: 'Max Sources', type: 'int', min: 1, max: 2048, step: 1, def: 512 },
@@ -38,12 +39,14 @@ const P = {
   clusterRadius: { label: 'Cluster Radius (px)', type: 'int', min: 0, max: 200, step: 1, def: 0 },
   alphaGate: { label: 'Gate with input alpha', type: 'check', def: false },
   sdrExpand: { label: 'SDR highlight expand', type: 'check', def: true, hint: 'PNG/JPG を読み込むとき白飛び付近を HDR に持ち上げる (1.0 → 50)' },
-  manualOn: { label: 'Enable manual light', type: 'check', def: false },
+  manualOn: { label: 'Enable manual light (画像モード)', type: 'check', def: false },
+  canvasSize: { label: 'Canvas (光点モード)', type: 'select', options: [['1280 × 720', 0], ['1920 × 1080', 1], ['3840 × 2160', 2]], def: 1 },
   manualX: { label: 'Light X (px)', type: 'range', min: -4000, max: 8000, step: 1, def: 1300 },
-  manualY: { label: 'Light Y (px)', type: 'range', min: -4000, max: 8000, step: 1, def: 330 },
-  manualRadiance: { label: 'Radiance', type: 'range', min: 0, max: 100000, step: 1, def: 2000, log: true },
+  manualY: { label: 'Light Y (px)', type: 'range', min: -4000, max: 8000, step: 1, def: 350 },
+  manualRadiance: { label: 'Radiance (scene-linear)', type: 'range', min: 0, max: 1e9, step: 0.01, def: 1000, log: true, hint: '光点 1 画素あたりのシーンリニア値。Scene white を掛けると輝度 (cd/m²) になります' },
   manualDiameter: { label: 'Diameter (px)', type: 'range', min: 0, max: 400, step: 1, def: 30 },
   manualTint: { label: 'Tint', type: 'color', def: '#fff3e0' },
+  sceneWhite: { label: 'Scene white: 1.0 = (cd/m²)', type: 'range', min: 1, max: 100000, step: 1, def: 1000, log: true, ui: true, hint: 'シーンリニア値 1.0 が何 cd/m² に当たるか（カメラ露出の基準）。晴天の白い紙 ≈ 25,000、曇天 ≈ 3,000、夕方 ≈ 1,000、室内 ≈ 100、夜景 ≈ 10' },
   useSensor: { label: 'Use sensor size', type: 'check', def: false },
   fovH: { label: 'FOV H (deg)', type: 'range', min: 1, max: 150, step: 0.1, def: 40 },
   autoFovV: { label: 'Auto FOV V', type: 'check', def: true },
@@ -74,7 +77,7 @@ const P = {
 const STORE = 'flaresim-web-v1';
 const state = {};
 for (const [k, d] of Object.entries(P)) state[k] = d.def;
-const view = { exposure: 0, mode: 0, hdr: false, tonemap: 2, bg: true, zoom: 1, offX: 0, offY: 0 };
+const view = { exposure: 0, mode: 0, hdr: false, tonemap: 2, bg: true, showLight: true, scene: 'light', zoom: 1, offX: 0, offY: 0 };
 try {
   const saved = JSON.parse(localStorage.getItem(STORE) || '{}');
   for (const k of Object.keys(P)) if (k in (saved.p || {})) state[k] = saved.p[k];
@@ -83,7 +86,7 @@ try {
 } catch { /* storage unavailable */ }
 function persist() {
   try {
-    localStorage.setItem(STORE, JSON.stringify({ p: Object.fromEntries(Object.keys(P).map(k => [k, state[k]])), v: { exposure: view.exposure, mode: view.mode, hdr: view.hdr, tonemap: view.tonemap, bg: view.bg }, lensFile: lens?.file }));
+    localStorage.setItem(STORE, JSON.stringify({ p: Object.fromEntries(Object.keys(P).map(k => [k, state[k]])), v: { exposure: view.exposure, mode: view.mode, hdr: view.hdr, tonemap: view.tonemap, bg: view.bg, showLight: view.showLight, scene: view.scene }, lensFile: lens?.file }));
   } catch { /* ignore */ }
 }
 
@@ -157,9 +160,19 @@ function refreshEnables() {
   dis('focal', !state.useSensor);
   dis('jitterSeed', state.pupilJitter !== 1);
   for (const k of ['pvRayGrid', 'pvMaxSources', 'pvDownsample', 'pvSpectral']) dis(k, !state.preview);
-  for (const k of ['manualX', 'manualY', 'manualRadiance', 'manualDiameter', 'manualTint']) dis(k, !state.manualOn);
-  for (const k of ['threshold', 'sourceCap', 'downsample', 'clusterRadius', 'alphaGate']) dis(k, !state.detect);
+  const lightMode = view.scene === 'light';
+  for (const k of ['manualX', 'manualY', 'manualRadiance', 'manualDiameter', 'manualTint', 'sceneWhite']) dis(k, !manualActive());
+  dis('manualOn', lightMode);
+  dis('canvasSize', !lightMode);
+  for (const k of ['threshold', 'sourceCap', 'downsample', 'clusterRadius', 'alphaGate']) dis(k, !state.detect || lightMode);
+  for (const k of ['detect', 'inputEV', 'sdrExpand']) dis(k, lightMode);
+  $('btnPick').disabled = lightMode || !state.detect;
+  $('lightPreset').disabled = !manualActive();
+  updateLightInfo();
 }
+
+// The manual light is always on in light-point mode.
+const manualActive = () => view.scene === 'light' || state.manualOn;
 
 function setParam(key, v, dragging = false) {
   state[key] = v;
@@ -169,13 +182,15 @@ function setParam(key, v, dragging = false) {
   }
   if (key === 'sdrExpand' && image && !image.hdr && image.file) { loadFile(image.file); return; }
   if (key === 'stopScale' && lens) { lens.setStopScale(v); updateLensInfo(); }
+  if (key === 'canvasSize' && view.scene === 'light') { setScene('light'); }
   refreshEnables();
   persist();
+  if (P[key].ui) return;
   // Gains only rescale cached buffers; the render pass is a no-op unless a
   // component (e.g. haze going from 0 to >0) has never been computed.
   if (P[key].live) { draw(); scheduleRender(dragging ? 150 : 60, dragging); return; }
   if (key.startsWith('exr')) return;
-  if (key.startsWith('manual')) drawOverlay();
+  if (key.startsWith('manual')) { drawOverlay(); draw(); }
   scheduleRender(dragging ? 80 : 60, dragging);
 }
 
@@ -305,9 +320,9 @@ async function renderOnce(gen, interactive) {
   const t0 = performance.now();
 
   // 1. sources
-  const manual = state.manualOn ? { x: state.manualX, y: state.manualY, radiance: state.manualRadiance, diameter: state.manualDiameter, tint: hexRGB(state.manualTint) } : null;
+  const manual = manualActive() ? { x: state.manualX, y: state.manualY, radiance: state.manualRadiance, diameter: state.manualDiameter, tint: hexRGB(state.manualTint) } : null;
   const srcParams = {
-    detect: state.detect, threshold: state.threshold, inputGain: 2 ** state.inputEV, sourceCap: state.sourceCap,
+    detect: state.detect && !image.blank, threshold: state.threshold, inputGain: 2 ** state.inputEV, sourceCap: state.sourceCap,
     maxSources: e.maxSources, downsample: e.downsample, clusterRadius: state.clusterRadius, alphaGate: state.alphaGate, manual,
   };
   const srcKey = JSON.stringify([image.id, srcParams, cam.tanH, cam.tanV]);
@@ -332,7 +347,7 @@ async function renderOnce(gen, interactive) {
   if (interactive) e = interactiveSettings(e, w, h, active.length, lastSources.length);
 
   // 3. ghosts
-  const ghostKey = JSON.stringify([srcKey, pairKey, active.map(p => p.a * 1000 + p.b), e.rayGrid, e.spectral, e.scale, state.pupilJitter, state.jitterSeed, state.blades, state.rotation]);
+  const ghostKey = JSON.stringify([srcKey, pairKey, active.map(p => p.a * 1000 + p.b), e.rayGrid, e.spectral, e.scale, state.pupilJitter, state.jitterSeed, state.blades, state.rotation, state.areaSample]);
   let ghostStats = null;
   if (ghostKey !== keys.ghost) {
     const grid = buildPupil(e.rayGrid, state.blades, state.rotation, state.pupilJitter, state.jitterSeed);
@@ -340,7 +355,7 @@ async function renderOnce(gen, interactive) {
     setStatus(`ゴースト追跡中… ${active.length} pairs × ${lastSources.length} sources × ${grid.length / 2} rays × ${spec.length / 4} λ`);
     setProgress(0);
     ghostStats = await gpu.renderGhosts({
-      lens, pairs: active, sources: lastSources, grid, spec, shw, shh, scale: e.scale, maxPasses: MAX_PASSES,
+      lens, pairs: active, sources: lastSources, grid, spec, shw, shh, scale: e.scale, maxPasses: MAX_PASSES, areaSample: state.areaSample,
     }, { onProgress: setProgress, isCancelled: cancelled });
     setProgress(null);
     if (ghostStats.cancelled || cancelled()) return;
@@ -398,7 +413,7 @@ async function renderOnce(gen, interactive) {
     if (cancelled()) return;
     const tp = performance.now();
     const grid = buildPupil(e.rayGrid, state.blades, state.rotation, state.pupilJitter, state.jitterSeed, ghostPasses);
-    await gpu.renderGhosts({ lens, pairs: active, sources: lastSources, grid, spec, shw, shh, pass: ghostPasses, maxPasses: MAX_PASSES });
+    await gpu.renderGhosts({ lens, pairs: active, sources: lastSources, grid, spec, shw, shh, pass: ghostPasses, maxPasses: MAX_PASSES, areaSample: state.areaSample });
     ghostPasses++;
     await blurGhost();
     draw();
@@ -495,6 +510,10 @@ function draw() {
       inputGain: view.bg || view.mode === 5 ? 2 ** state.inputEV : 0, ghostGain: state.flareGain * e.dsRatio * e.dsRatio,
       hazeGain: state.hazeGain, starGain: state.starGain, hdrScale: 1,
       mode: view.mode, tonemap: view.tonemap, hdr: view.hdr,
+      light: view.showLight && manualActive() ? {
+        x: state.manualX, y: state.manualY, r: Math.max(state.manualDiameter / 2, 1.5),
+        rgb: hexRGB(state.manualTint).map(c => c * state.manualRadiance),
+      } : null,
     });
     drawOverlay();
   });
@@ -513,21 +532,25 @@ function drawOverlay() {
       g.strokeRect(x - r, y - r, 2 * r, 2 * r);
     }
   }
-  if (state.manualOn) {
+  if (manualActive()) {
+    // Handle: a thin dashed ring outside the disc so the light itself stays visible.
     const [x, y] = P2(state.manualX, state.manualY);
-    g.strokeStyle = '#ffb547'; g.lineWidth = 1.5 * dpr;
-    g.beginPath(); g.arc(x, y, 10 * dpr, 0, Math.PI * 2); g.stroke();
-    g.beginPath(); g.moveTo(x - 16 * dpr, y); g.lineTo(x + 16 * dpr, y); g.moveTo(x, y - 16 * dpr); g.lineTo(x, y + 16 * dpr); g.stroke();
+    const r = Math.max(state.manualDiameter / 2 * view.zoom + 6 * dpr, 14 * dpr);
+    g.strokeStyle = 'rgba(255,181,71,0.8)'; g.lineWidth = 1 * dpr; g.setLineDash([4 * dpr, 4 * dpr]);
+    g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.stroke();
+    g.setLineDash([]);
   }
 }
 
 let drag = null;
 viewer.addEventListener('pointerdown', ev => {
   if (!image || ev.target.closest('.vbar')) return;
-  viewer.setPointerCapture(ev.pointerId);
   const cx = ev.offsetX * dpr, cy = ev.offsetY * dpr;
+  if (picking && ev.button === 0) { pickThreshold(cx, cy); return; }
+  viewer.setPointerCapture(ev.pointerId);
   const lx = view.offX + state.manualX * view.zoom, ly = view.offY + state.manualY * view.zoom;
-  const onLight = state.manualOn && ev.button === 0 && Math.hypot(cx - lx, cy - ly) < 22 * dpr;
+  // In light-point mode a plain left drag anywhere moves the light; elsewhere only on the handle.
+  const onLight = manualActive() && ev.button === 0 && (view.scene === 'light' || Math.hypot(cx - lx, cy - ly) < 22 * dpr);
   drag = { mode: onLight ? 'light' : 'pan', x: cx, y: cy, ox: view.offX, oy: view.offY };
 });
 viewer.addEventListener('pointermove', ev => {
@@ -547,8 +570,8 @@ viewer.addEventListener('pointerup', ev => {
   drag = null;
 });
 viewer.addEventListener('dblclick', ev => {
-  if (!image || ev.target.closest('.vbar')) return;
-  if (!state.manualOn) { state.manualOn = true; widgets.manualOn.set(true); }
+  if (!image || ev.target.closest('.vbar') || picking) return;
+  if (!manualActive()) { state.manualOn = true; widgets.manualOn.set(true); }
   moveLight(ev.offsetX * dpr, ev.offsetY * dpr, false);
 });
 viewer.addEventListener('wheel', ev => {
@@ -560,7 +583,7 @@ function moveLight(cx, cy, dragging) {
   state.manualX = Math.round((cx - view.offX) / view.zoom);
   state.manualY = Math.round((cy - view.offY) / view.zoom);
   widgets.manualX.set(state.manualX); widgets.manualY.set(state.manualY);
-  refreshEnables(); persist(); drawOverlay();
+  refreshEnables(); persist(); drawOverlay(); draw();
   scheduleRender(dragging ? 40 : 0, dragging);
 }
 
@@ -569,13 +592,126 @@ function probe(cx, cy) {
   const x = Math.floor((cx - view.offX) / view.zoom), y = Math.floor((cy - view.offY) / view.zoom);
   if (x < 0 || y < 0 || x >= image.width || y >= image.height) { $('probe').textContent = ''; return; }
   const i = (y * image.width + x) * 4, k = 2 ** state.inputEV, d = image.data;
-  $('probe').textContent = `${x}, ${y}  in ${(d[i] * k).toFixed(3)} ${(d[i + 1] * k).toFixed(3)} ${(d[i + 2] * k).toFixed(3)}`;
+  const L = (0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]) * k;
+  $('probe').textContent = `${x}, ${y}  in ${(d[i] * k).toFixed(3)} ${(d[i + 1] * k).toFixed(3)} ${(d[i + 2] * k).toFixed(3)}  L ${L.toPrecision(4)}` +
+    (picking ? `  block L ${blockLuma(x, y).toPrecision(4)}` : '');
+}
+
+// ---------------------------------------------------------------------------
+// Threshold picker: the detector compares Downsample-block averages, so the
+// picked value is the block luminance at the clicked point (Threshold equal to
+// it keeps that block as a source; raise it to drop the block).
+// ---------------------------------------------------------------------------
+let picking = false;
+function blockLuma(x, y) {
+  const ds = Math.max(1, eff().downsample | 0), w = image.width, h = image.height, d = image.data;
+  const x0 = Math.floor(x / ds) * ds, y0 = Math.floor(y / ds) * ds;
+  let s = 0, n = 0;
+  for (let yy = y0; yy < Math.min(y0 + ds, h); yy++) for (let xx = x0; xx < Math.min(x0 + ds, w); xx++) {
+    const i = (yy * w + xx) * 4;
+    s += 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]; n++;
+  }
+  return n ? s / n * 2 ** state.inputEV : 0;
+}
+function setPicking(on) {
+  picking = on;
+  viewer.classList.toggle('picking', on);
+  $('btnPick').classList.toggle('on', on);
+  $('pickInfo').textContent = on ? 'ビュー上をクリック（Esc で中止）' : $('pickInfo').textContent;
+}
+function pickThreshold(cx, cy) {
+  const x = Math.floor((cx - view.offX) / view.zoom), y = Math.floor((cy - view.offY) / view.zoom);
+  setPicking(false);
+  if (x < 0 || y < 0 || x >= image.width || y >= image.height) return;
+  const L = blockLuma(x, y);
+  const v = Math.max(P.threshold.min, Math.floor(L * 1000) / 1000);
+  widgets.threshold.set(v);
+  setParam('threshold', v);
+  $('pickInfo').textContent = `(${x}, ${y}) の輝度 ${L.toPrecision(4)} を設定。上げると暗い光源が外れます`;
+}
+$('btnPick').onclick = () => setPicking(!picking);
+
+// ---------------------------------------------------------------------------
+// Light point: real-world brightness readout and presets
+// ---------------------------------------------------------------------------
+// Rough luminance of common sources [cd/m²] and apparent diameter [deg] (0 = keep).
+const LIGHT_PRESETS = [
+  ['太陽（晴天の日中）', 1.6e9, 0.53],
+  ['車のヘッドライト（LED / HID）', 5e7, 0],
+  ['ハロゲン電球（フィラメント）', 2e7, 0],
+  ['LED 街灯', 5e6, 0],
+  ['白熱電球（フロスト）', 1e5, 0],
+  ['ろうそくの炎', 1e4, 0],
+  ['満月', 2.5e3, 0.52],
+];
+const fmtSI = v => (v >= 1e4 ? v.toExponential(2).replace('e+', '×10^') : v.toPrecision(4));
+function updateLightInfo() {
+  const el = $('lightInfo');
+  if (!el || !image) return;
+  const cam = camera(image.width, image.height);
+  const L = state.manualRadiance * state.sceneWhite;
+  const ev = Math.log2(Math.max(state.manualRadiance, 1e-9));
+  const degPerPx = cam.fh * 180 / Math.PI / image.width;
+  const ang = state.manualDiameter * degPerPx;
+  el.innerHTML = `輝度 <input id="lumIn" type="number" step="any" value="${L.toPrecision(4)}"> cd/m²` +
+    `<br><b>${fmtSI(L)}</b> cd/m² · シーンの白の <b>${ev >= 0 ? '+' : ''}${ev.toFixed(1)} EV</b>` +
+    `<br>視直径 <b>${ang.toFixed(3)}°</b>（${state.manualDiameter}px、1px = ${(degPerPx * 60).toFixed(2)}′）`;
+  $('lumIn').onchange = e => {
+    const v = Number(e.target.value);
+    if (!(v >= 0)) return;
+    const r = v / state.sceneWhite;
+    widgets.manualRadiance.set(r);
+    setParam('manualRadiance', r);
+  };
+}
+function initLightPresets() {
+  const s = $('lightPreset');
+  s.innerHTML = '<option value="">— 選択 —</option>' + LIGHT_PRESETS.map(([n, L, a], i) =>
+    `<option value="${i}">${n}  ${fmtSI(L)} cd/m²${a ? ' · ' + a + '°' : ''}</option>`).join('');
+  s.onchange = () => {
+    const p = LIGHT_PRESETS[Number(s.value)];
+    s.value = '';
+    if (!p || !image) return;
+    const [, L, ang] = p;
+    if (ang) {
+      const degPerPx = camera(image.width, image.height).fh * 180 / Math.PI / image.width;
+      const d = Math.min(P.manualDiameter.max, Math.max(1, Math.round(ang / degPerPx)));
+      state.manualDiameter = d; widgets.manualDiameter.set(d);
+    }
+    const r = L / state.sceneWhite;
+    widgets.manualRadiance.set(r);
+    setParam('manualRadiance', r);
+  };
 }
 
 // ---------------------------------------------------------------------------
 // Image loading
 // ---------------------------------------------------------------------------
 let imageSeq = 0;
+let lastPhoto = null;   // image shown in 画像 mode (loaded file or test scene)
+const CANVAS_SIZES = [[1280, 720], [1920, 1080], [3840, 2160]];
+function setScene(scene, img = null) {
+  const prevW = image?.width;
+  view.scene = scene;
+  $('modeLight').classList.toggle('on', scene === 'light');
+  $('modeImage').classList.toggle('on', scene === 'image');
+  if (scene === 'light') {
+    const [w, h] = CANVAS_SIZES[state.canvasSize] || CANVAS_SIZES[1];
+    // keep the light at the same relative position when the canvas size changes
+    if (prevW && image?.blank && prevW !== w) {
+      const k = w / prevW;
+      state.manualX = Math.round(state.manualX * k); state.manualY = Math.round(state.manualY * k);
+      state.manualDiameter = Math.round(state.manualDiameter * k);
+      widgets.manualX.set(state.manualX); widgets.manualY.set(state.manualY); widgets.manualDiameter.set(state.manualDiameter);
+    }
+    setImage(makeBlank(w, h));
+  } else {
+    if (img) lastPhoto = img;
+    setImage(lastPhoto || (lastPhoto = makeTestScene()));
+  }
+  refreshEnables();
+  persist();
+}
 function setImage(img) {
   const max = gpu.maxPixels;
   while (img.width * img.height > max) img = halve(img);
@@ -585,6 +721,7 @@ function setImage(img) {
   keys.src = keys.ghost = keys.haze = keys.star = '';
   $('dropzone').classList.add('hidden');
   fitView();
+  updateLightInfo();
   scheduleRender(0);
 }
 function halve(img) {
@@ -601,14 +738,16 @@ async function loadFile(file) {
     setStatus(`${file.name} を読み込み中…`);
     const img = await loadImageFile(file, { sdrExpand: state.sdrExpand });
     img.file = file;
-    setImage(img);
+    setScene('image', img);
   } catch (e) {
     console.error(e);
     setStatus('読み込みに失敗しました: ' + e.message, true);
   }
 }
 $('fileImage').onchange = ev => ev.target.files[0] && loadFile(ev.target.files[0]);
-$('btnTest').onclick = () => setImage(makeTestScene());
+$('btnTest').onclick = () => setScene('image', makeTestScene());
+$('modeLight').onclick = () => setScene('light');
+$('modeImage').onclick = () => setScene('image');
 viewer.addEventListener('dragover', ev => { ev.preventDefault(); viewer.classList.add('drag'); });
 viewer.addEventListener('dragleave', () => viewer.classList.remove('drag'));
 viewer.addEventListener('drop', ev => {
@@ -645,7 +784,7 @@ async function composeLinear() {
     }
     out[i + 3] = m === 0 || m === 5 ? inp[i + 3] : 1;
   }
-  return { out, ghost, haze, star, gg, hg, sg, hasAlpha: m === 0 || m === 5 };
+  return { out, ghost, haze, star, gg, hg, sg, hasAlpha: (m === 0 || m === 5) && !image.blank };
 }
 
 $('btnExr').onclick = async () => {
@@ -687,7 +826,7 @@ $('btnPng').onclick = async () => {
   cv.getContext('2d').putImageData(new ImageData(px, w, h), 0, 0);
   download(await cv.convertToBlob({ type: 'image/png' }), baseName() + '_flare.png');
 };
-const baseName = () => (image.name || 'image').replace(/\.\w+$/, '');
+const baseName = () => (image.blank ? 'lightpoint' : (image.name || 'image').replace(/\.\w+$/, ''));
 function download(blob, name) {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob); a.download = name;
@@ -710,6 +849,9 @@ function initViewControls() {
   ex.ondblclick = () => { ex.value = 0; ex.oninput(); };
   $('outputMode').value = view.mode;
   $('outputMode').onchange = ev => { view.mode = Number(ev.target.value); persist(); draw(); };
+  const lightCb = $('lightOn');
+  lightCb.checked = view.showLight;
+  lightCb.onchange = () => { view.showLight = lightCb.checked; persist(); draw(); };
   const bgCb = $('bgOn');
   bgCb.checked = view.bg;
   bgCb.onchange = () => { view.bg = bgCb.checked; persist(); draw(); };
@@ -733,6 +875,8 @@ function initViewControls() {
     if (ev.target.matches('input, select, textarea')) return;
     if (ev.key === 'f') fitView();
     if (ev.key === 'b') { view.bg = !view.bg; $('bgOn').checked = view.bg; persist(); draw(); }
+    if (ev.key === 'l') { view.showLight = !view.showLight; $('lightOn').checked = view.showLight; persist(); draw(); }
+    if (ev.key === 'Escape' && picking) setPicking(false);
     if (ev.key === 'p') { setParam('preview', !state.preview); widgets.preview.set(state.preview); }
     if (ev.key >= '1' && ev.key <= '6') { view.mode = Number(ev.key) - 1; $('outputMode').value = view.mode; draw(); }
   });
@@ -755,6 +899,7 @@ function showGpuInfo(adapter) {
 // ---------------------------------------------------------------------------
 async function boot() {
   buildWidgets();
+  initLightPresets();
   initViewControls();
   new ResizeObserver(resizeCanvas).observe(viewer);
   try {
@@ -768,6 +913,6 @@ async function boot() {
   resizeCanvas();
   window.flaresim = { state, view, get gpu() { return gpu; }, get image() { return image; }, get sources() { return lastSources; } };
   await loadCatalog();
-  setImage(makeTestScene());
+  setScene(view.scene === 'image' ? 'image' : 'light');
 }
 boot();

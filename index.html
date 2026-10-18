@@ -17,6 +17,9 @@
 <header class="top">
   <div class="brand">FlareSim <span>Web</span></div>
   <div class="toolbar">
+    <div class="seg" title="光点：黒背景に動かせる光点を 1 つ置くモード / 画像：写真や EXR の明るい部分を光源にするモード">
+      <button id="modeLight" class="seg-btn">光点</button><button id="modeImage" class="seg-btn">画像</button>
+    </div>
     <label class="btn">画像を開く<input id="fileImage" type="file" accept=".exr,.hdr,.png,.jpg,.jpeg,.webp,.avif" hidden></label>
     <button id="btnTest" class="btn">テストシーン</button>
     <span class="sep"></span>
@@ -42,6 +45,7 @@
         <option value="5">Sources</option>
       </select>
       <label class="inline">EV <input id="exposure" type="range" min="-10" max="10" step="0.1" value="0"><output id="exposureOut">0.0</output></label>
+      <label class="inline" title="光点そのものの表示 [L]。表示だけのレイヤーで、書き出しには含まれません"><input id="lightOn" type="checkbox" checked> 光点</label>
       <label class="inline" title="入力画像（背景）の表示 [B]。オフで書き出すとフレアだけの RGB になります"><input id="bgOn" type="checkbox" checked> 背景</label>
       <label class="inline" title="HDR ディスプレイで 1.0 を超える輝度をそのまま表示"><input id="hdrOn" type="checkbox"> HDR</label>
       <select id="tonemap" title="SDR 表示時のトーンマップ">
@@ -76,6 +80,7 @@
       <div class="param" data-key="pupilJitter"></div>
       <div class="param" data-key="jitterSeed"></div>
       <div class="param" data-key="passes"></div>
+      <div class="param" data-key="areaSample"></div>
       <div class="param" data-key="spectral"></div>
     </details>
 
@@ -83,6 +88,7 @@
       <summary>Sources</summary>
       <div class="param" data-key="detect"></div>
       <div class="param" data-key="threshold"></div>
+      <div class="row2"><button id="btnPick" class="btn small" title="ビュー上の明るい部分をクリックすると、その場所（Downsample のブロック平均）の輝度を Threshold にします">スポイトで Threshold を選ぶ</button><span id="pickInfo" class="hint"></span></div>
       <div class="param" data-key="inputEV"></div>
       <div class="param" data-key="sourceCap"></div>
       <div class="param" data-key="maxSources"></div>
@@ -90,13 +96,18 @@
       <div class="param" data-key="clusterRadius"></div>
       <div class="param" data-key="alphaGate"></div>
       <div class="param" data-key="sdrExpand"></div>
-      <h4>Manual light <small>(AE 版の Light Position — ビュー上をドラッグ)</small></h4>
+      <h4>Light point / Manual light <small>(光点モードでは常に有効。ビュー上をドラッグで移動)</small></h4>
       <div class="param" data-key="manualOn"></div>
+      <div class="param" data-key="canvasSize"></div>
       <div class="param" data-key="manualX"></div>
       <div class="param" data-key="manualY"></div>
       <div class="param" data-key="manualRadiance"></div>
       <div class="param" data-key="manualDiameter"></div>
       <div class="param" data-key="manualTint"></div>
+      <div class="param" data-key="sceneWhite"></div>
+      <label class="sub">明るさのプリセット（目安）</label>
+      <select id="lightPreset"></select>
+      <div id="lightInfo" class="lightinfo"></div>
     </details>
 
     <details>

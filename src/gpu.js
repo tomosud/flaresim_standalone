@@ -46,7 +46,7 @@ export class FlareGPU {
       fragment: { module: dm, entryPoint: 'fs', targets: [{ format: 'rgba16float' }] },
       primitive: { topology: 'triangle-list' },
     });
-    this.uDisplay = d.createBuffer({ size: 64, usage: UNI });
+    this.uDisplay = d.createBuffer({ size: 96, usage: UNI });
     this.hdr = null;
     this.configure(false);
   }
@@ -173,17 +173,18 @@ export class FlareGPU {
     const pairArr = new Float32Array(nPairs * 4);
     pairs.forEach((p, i) => pairArr.set([p.a, p.b, p.boost, 0], i * 4));
     const srcArr = new Float32Array(nSrc * 8);
-    sources.forEach((s, i) => srcArr.set([s.ax, s.ay, 0, 0, s.r, s.g, s.b, 0], i * 8));
+    sources.forEach((s, i) => srcArr.set([s.ax, s.ay, s.ex || 0, s.ey || 0, s.r, s.g, s.b, s.disc ? 1 : 0], i * 8));
     const bPairs = this.storage(pairArr, 'pairs'), bSrc = this.storage(srcArr, 'sources');
     const bGrid = this.storage(grid, 'grid'), bSpec = this.storage(spec, 'spec');
-    const uBuf = this.buf(64, UNI, 'ghostU');
+    const uBuf = this.buf(80, UNI, 'ghostU');
     const bg = this.bind(this.pGhost, [uBuf, uLens, bPairs, bSrc, bGrid, bSpec, this.bAcc]);
 
-    const uData = new ArrayBuffer(64), uU = new Uint32Array(uData), uF = new Float32Array(uData);
+    const uData = new ArrayBuffer(80), uU = new Uint32Array(uData), uF = new Float32Array(uData);
     uU[0] = lens.n; uU[1] = nGrid; uU[2] = nSpec;
     uU[6] = gw; uU[7] = gh;
     uF[8] = lens.sensorZ; uF[9] = lens.surfaces[0].semi; uF[10] = lens.surfaces[0].z - 20;
     uF[11] = job.shw; uF[12] = job.shh; uF[13] = 1 / nGrid; uF[14] = fixedScale;
+    uU[16] = pass; uU[17] = job.areaSample ? 1 : 0;
 
     // Split into dispatches of ~budget traces (OS GPU watchdogs kill long
     // dispatches): a block of sources x a block of pairs per dispatch.
@@ -280,13 +281,15 @@ export class FlareGPU {
     this.device.queue.submit([enc.finish()]);
   }
 
-  // v: {offX, offY, zoom, exposure, inputGain, ghostGain, hazeGain, starGain, hdrScale, mode, tonemap, hdr}
+  // v: {offX, offY, zoom, exposure, inputGain, ghostGain, hazeGain, starGain, hdrScale, mode, tonemap, hdr,
+  //     light: null | {x, y, r, rgb:[r,g,b]}}
   draw(v) {
     if (!this.displayBG) return;
     this.configure(!!v.hdr);
-    const b = new ArrayBuffer(64), f = new Float32Array(b), u = new Uint32Array(b);
+    const b = new ArrayBuffer(96), f = new Float32Array(b), u = new Uint32Array(b);
     f.set([this.w, this.h, v.offX, v.offY, v.zoom, v.exposure, v.inputGain, v.ghostGain, v.hazeGain, v.starGain, v.hdrScale, this.gScale]);
-    u[12] = v.mode; u[13] = v.tonemap; u[14] = v.hdr ? 1 : 0;
+    u[12] = v.mode; u[13] = v.tonemap; u[14] = v.hdr ? 1 : 0; u[15] = v.light ? 1 : 0;
+    if (v.light) f.set([v.light.x, v.light.y, v.light.r, 0, ...v.light.rgb, 0], 16);
     this.device.queue.writeBuffer(this.uDisplay, 0, b);
     const enc = this.device.createCommandEncoder();
     const pass = enc.beginRenderPass({

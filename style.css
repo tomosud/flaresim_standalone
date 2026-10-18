@@ -23,6 +23,17 @@ code { font-size: 12px; color: var(--ink2); }
 .brand span { color: var(--accent); }
 .toolbar { display: flex; gap: 8px; align-items: center; flex: 1; flex-wrap: wrap; }
 .sep { width: 1px; height: 22px; background: var(--line); }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.seg-btn { height: 28px; padding: 0 12px; border: 0; background: var(--panel2); color: var(--ink2); cursor: pointer; font: inherit; }
+.seg-btn + .seg-btn { border-left: 1px solid var(--line); }
+.seg-btn.on { background: var(--accent); color: #17130a; font-weight: 600; }
+.viewer.picking, .viewer.picking:active { cursor: crosshair; }
+.btn.on { border-color: var(--accent); color: var(--accent); }
+label.sub { display: block; color: var(--ink2); font-size: 12px; margin: 6px 0 2px; }
+#lightPreset { width: 100%; }
+.lightinfo { margin: 6px 0; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel2); font-size: 12px; color: var(--ink2); line-height: 1.6; font-variant-numeric: tabular-nums; }
+.lightinfo b { color: var(--ink); }
+.lightinfo input { width: 110px; }
 .hdrstat { font-size: 12px; color: var(--muted); border: 1px solid var(--line); padding: 2px 8px; border-radius: 10px; white-space: nowrap; }
 .hdrstat.on { color: #111; background: var(--accent); border-color: var(--accent); }
 .hdrstat.warn { color: var(--warn); border-color: var(--warn); }

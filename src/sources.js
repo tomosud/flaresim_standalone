@@ -47,7 +47,9 @@ export function detectSources(img, p, tanH, tanV) {
         const bx0 = dx * ds, bx1 = Math.min(bx0 + ds, w);
         const by0 = dy * ds, by1 = Math.min(by0 + ds, h);
         const cx = (bx0 + bx1) * 0.5, cy = (by0 + by1) * 0.5;
-        sources.push(makeSource(cx, cy, w, h, tanH, tanV, r, g, b));
+        const s = makeSource(cx, cy, w, h, tanH, tanV, r, g, b);
+        s.ex = (bx1 - bx0) / 2 * (2 * tanH / w); s.ey = (by1 - by0) / 2 * (2 * tanV / h);   // block half-size
+        sources.push(s);
         hazeGrid.set([r, g, b, 1], bi * 4);
       }
     }
@@ -63,6 +65,8 @@ export function detectSources(img, p, tanH, tanV) {
     }
     const s = makeSource(m.x, m.y, w, h, tanH, tanV, rad * m.tint[0], rad * m.tint[1], rad * m.tint[2]);
     s.manual = true;
+    const rad2 = Math.max(m.diameter, 0) / 2;          // disc radius in px
+    s.ex = rad2 * (2 * tanH / w); s.ey = rad2 * (2 * tanV / h); s.disc = true;
     sources.push(s);
     const bx = Math.floor(m.x / ds), by = Math.floor(m.y / ds);
     if (bx >= 0 && by >= 0 && bx < dw && by < dh) {
@@ -110,7 +114,7 @@ function clusterSources(src, radiusPx, w, h, tanH, tanV) {
     }
     const mx = sw > 0 ? ax / sw : s.ax, my = sw > 0 ? ay / sw : s.ay;
     out.push({
-      ax: mx, ay: my, r, g, b, manual: s.manual,
+      ax: mx, ay: my, r, g, b, manual: s.manual, ex: s.ex + thresh / 2, ey: s.ey + radiusPx / 2 * (2 * tanV / h), disc: s.disc,
       px: w * 0.5 + Math.tan(mx) / (2 * tanH) * w,
       py: h * 0.5 + Math.tan(my) / (2 * tanV) * h,
     });

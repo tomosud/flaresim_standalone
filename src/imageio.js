@@ -71,6 +71,13 @@ export async function loadImageFile(file, opts = {}) {
   return { name, width: bmp.width, height: bmp.height, hdr: false, data };
 }
 
+// Black plate for the light-point mode (the emitter is the manual light).
+export function makeBlank(w, h) {
+  const data = new Float32Array(w * h * 4);
+  for (let i = 3; i < data.length; i += 4) data[i] = 1;
+  return { name: 'light', width: w, height: h, hdr: true, blank: true, data };
+}
+
 // Dusk sky + sun + a row of street lights. Values are scene-linear HDR.
 export function makeTestScene(w = 1920, h = 1080) {
   const data = new Float32Array(w * h * 4);
